@@ -1,135 +1,119 @@
 # Pave Bank Fees API
 
-A billing system built with [Encore](https://encore.dev) for service orchestration and [Temporal](https://temporal.io) for durable workflow management.
+A billing service built on [Encore](https://encore.dev) (HTTP, deploy, DB)
+and [Temporal](https://temporal.io) (durable workflow per bill).
 
-## Architecture
+A bill is a long-running Temporal workflow that accumulates line items via
+synchronous workflow updates and finalises on a close signal. Closed bills
+are persisted to Postgres in a single transactional activity. Currencies
+are a configurable registry — operators INSERT into the `currencies` table
+to enable a new code, no code deploy.
 
-The bill lifecycle is modeled as a long-running Temporal workflow:
-
-1. **CreateBill** starts a new workflow (one per bill)
-2. **AddLineItem** signals the running workflow to accumulate items in memory
-3. **CloseBill** signals the workflow to finalize, persist to DB, and complete
-4. **GetBill** queries the workflow state (or DB if closed)
-
-Temporal provides: sequential signal processing (no race conditions), crash recovery via event sourcing, and efficient long-running timers.
-
-### Money Representation
-
-All monetary amounts use `int64` minor units (cents for USD, tetri for GEL). No floating point arithmetic.
-
-## Prerequisites
-
-- [Encore CLI](https://encore.dev/docs/install) (`curl -L https://encore.dev/install.sh | bash`)
-- [Docker](https://docs.docker.com/get-docker/) (for Temporal server + PostgreSQL)
-- Go 1.22+
-
-## Setup
+## Quick start
 
 ```bash
-# 1. Start Temporal server
-docker compose up -d
-
-# 2. Start the Encore app (auto-provisions PostgreSQL + runs migrations)
-encore run
-
-# 3. Access Temporal UI
-open http://localhost:8233
-
-# 4. Access Encore local dashboard
-open http://localhost:9400
+docker compose up -d            # Temporal server on :7233, UI on :8233
+encore run                       # Encore provisions PG and runs migrations
+open http://localhost:9400      # Encore dev dashboard
+open http://localhost:8233      # Temporal Web UI
 ```
 
-## API Reference
+The Encore app listens on `:4000` by default.
 
-### Create Bill
+## At a glance
+
+```mermaid
+flowchart LR
+  Client[Client]
+  subgraph Encore[Encore Service]
+    EP[HTTP endpoints]
+    WK[Temporal worker]
+  end
+  Temporal[(Temporal Server)]
+  PG[(Postgres)]
+
+  Client -->|HTTP| EP
+  EP -->|Update / Signal / Query| Temporal
+  Temporal --> WK
+  WK -->|Activities| PG
+  EP -->|Reads after close| PG
+```
+
+## API
+
+| Method | Path                       | Purpose                                    |
+| ------ | -------------------------- | ------------------------------------------ |
+| POST   | `/bills`                   | Create a bill (starts a workflow)          |
+| POST   | `/bills/:id/line-items`    | Add a line item (sync workflow update)     |
+| POST   | `/bills/:id/close`         | Close a bill (signal + drain + persist)    |
+| GET    | `/bills/:id`               | Get a bill (workflow query → DB fallback)  |
+| GET    | `/bills?limit=&offset=`    | List closed bills (DB, paginated)          |
+
+Amounts are JSON strings (full decimal precision). Currencies are
+ISO-4217 codes; whether a code is accepted is governed by the
+`currencies` table.
+
+### Create a bill
 
 ```bash
 curl -X POST http://localhost:4000/bills \
-  -H "Content-Type: application/json" \
+  -H 'Content-Type: application/json' \
   -d '{"currency": "USD"}'
+# {"billId": "<uuid>", "status": "OPEN", "currency": "USD"}
 ```
 
-Response:
-```json
-{"billId": "uuid", "status": "OPEN", "currency": "USD"}
-```
-
-### Add Line Item
+### Add a line item
 
 ```bash
-curl -X POST http://localhost:4000/bills/{id}/line-items \
-  -H "Content-Type: application/json" \
+curl -X POST http://localhost:4000/bills/<billId>/line-items \
+  -H 'Content-Type: application/json' \
   -d '{
-    "idempotencyKey": "unique-key-1",
-    "description": "Monthly service fee",
-    "amountMinor": 1500,
-    "currency": "USD"
+    "idempotencyKey": "fee-2026-01",
+    "description":    "Monthly service fee",
+    "amount":         "15.00",
+    "currency":       "USD"
   }'
+# {"itemId": "fee-2026-01", "billTotal": "15.00", "itemCount": 1}
 ```
 
-Response:
-```json
-{"itemId": "unique-key-1", "billTotal": 1500, "itemCount": 1}
-```
+The update is synchronous: by the time the response returns, the
+workflow has applied the item and the totals reflect it. A currency
+mismatch, non-positive amount, or empty description is rejected by the
+workflow's validator and returns `InvalidArgument` *without* mutating
+state.
 
-### Close Bill
+### Close a bill
 
 ```bash
-curl -X POST http://localhost:4000/bills/{id}/close
+curl -X POST http://localhost:4000/bills/<billId>/close
 ```
 
-Response:
-```json
-{
-  "billId": "uuid",
-  "status": "CLOSED",
-  "totalAmount": 4000,
-  "currency": "USD",
-  "lineItems": [...],
-  "closedAt": "2024-01-15T10:30:00Z"
-}
-```
-
-### Get Bill
-
-```bash
-curl http://localhost:4000/bills/{id}
-```
-
-### List Bills (closed, from DB)
-
-```bash
-curl http://localhost:4000/bills
-```
-
-## Error Semantics
-
-| Scenario | HTTP Status | Error Code |
-|----------|-------------|------------|
-| Invalid currency | 400 | `invalid_argument` |
-| Missing required field | 400 | `invalid_argument` |
-| Bill not found | 404 | `not_found` |
-| Add item to closed bill | 409 | `failed_precondition` |
-| Currency mismatch | 400 | `invalid_argument` |
-| Temporal unavailable | 503 | `unavailable` |
-| Duplicate bill creation | 409 | `already_exists` |
+Sends a `CloseBill` signal. The workflow drains any in-flight updates,
+flips `status` to `CLOSED`, and runs `PersistBillActivity` (idempotent
+upsert) inside a transaction.
 
 ## Testing
 
 ```bash
-# Run all tests
-encore test ./bill/...
-
-# With race detection
-encore test -race ./bill/...
-
-# With coverage
-encore test -cover ./bill/...
+encore test ./bill/...          # all tests
+encore test -cover ./bill/...   # with coverage
 ```
 
-## Design Decisions
+Tests run under the Encore harness because the package imports
+`encore.dev/storage/sqldb`, which panics outside the runtime.
 
-- **One currency per bill** — line items must match the bill's currency. Cross-currency conversion is the caller's responsibility.
-- **Idempotent line items** — duplicate `idempotencyKey` values are silently ignored (no double-counting).
-- **ContinueAsNew at 1000 items** — protects against Temporal's 50K event history limit.
-- **No DB writes until close** — all state lives in the workflow until finalization. This eliminates consistency issues between workflow state and DB state.
+## Design decisions
+
+- **One currency per bill.** The workflow validator rejects items whose
+  currency differs from the bill's. Cross-currency conversion is a
+  separate concern.
+- **Idempotent line items.** Duplicate `idempotencyKey` values are
+  silently ignored at the workflow level (no double-counting).
+- **`shopspring/decimal` end-to-end.** No `int64` minor units. Amounts
+  are stored as `NUMERIC(30,10)` so FX and interest math stays exact.
+- **ContinueAsNew at 1000 items.** Keeps Temporal history bounded.
+  State is carried over as a `Snapshot` field on `BillWorkflowInput`.
+- **No DB writes until close.** All in-flight state lives in the
+  workflow. Eliminates dual-write consistency issues.
+- **Fail-closed registry.** A DB outage during a cache miss makes the
+  service reject unknown currencies rather than admit them.
