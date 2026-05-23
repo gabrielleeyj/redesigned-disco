@@ -16,42 +16,26 @@ type CurrencyMeta struct {
 	Decimals    int32
 }
 
-// currencies is the registry of supported currencies. It is populated by
-// initService from the currencies table at service startup and stays
-// empty in any context that does not boot the service (which would fail
-// other things first — sqldb.NewDatabase panics outside the Encore
-// runtime). Operators add or remove currencies via SQL against the
-// currencies table; a service restart picks up the change.
-var currencies = map[Currency]CurrencyMeta{}
-
 // Compatibility shims for the original API. New code should use the registry.
 const (
 	CurrencyUSD Currency = "USD"
 	CurrencyGEL Currency = "GEL"
 )
 
-// setCurrencies replaces the registry. Called by initService after the DB
-// load completes.
-//
-//nolint:unused // called by initService, which is invoked by Encore
-func setCurrencies(m map[Currency]CurrencyMeta) {
-	currencies = m
-}
-
 func (c Currency) Meta() (CurrencyMeta, bool) {
-	meta, ok := currencies[c]
+	meta, ok := getCurrencies()[c]
 	return meta, ok
 }
 
 func (c Currency) Valid() bool {
-	_, ok := currencies[c]
+	_, ok := getCurrencies()[c]
 	return ok
 }
 
 // Decimals returns the ISO-4217 fractional digit count for the currency.
 // Falls back to 2 for unknown codes; callers should also check Valid().
 func (c Currency) Decimals() int32 {
-	if meta, ok := currencies[c]; ok {
+	if meta, ok := getCurrencies()[c]; ok {
 		return meta.Decimals
 	}
 	return 2
