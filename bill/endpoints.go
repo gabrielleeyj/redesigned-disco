@@ -7,6 +7,7 @@ import (
 
 	"encore.dev/beta/errs"
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 )
@@ -74,16 +75,16 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Crea
 }
 
 type AddLineItemRequest struct {
-	IdempotencyKey string `json:"idempotencyKey"`
-	Description    string `json:"description"`
-	AmountMinor    int64  `json:"amountMinor"`
-	Currency       string `json:"currency"`
+	IdempotencyKey string          `json:"idempotencyKey"`
+	Description    string          `json:"description"`
+	Amount         decimal.Decimal `json:"amount"`
+	Currency       string          `json:"currency"`
 }
 
 type AddLineItemResponse struct {
-	ItemID    string `json:"itemId"`
-	BillTotal int64  `json:"billTotal"`
-	ItemCount int    `json:"itemCount"`
+	ItemID    string          `json:"itemId"`
+	BillTotal decimal.Decimal `json:"billTotal"`
+	ItemCount int             `json:"itemCount"`
 }
 
 //encore:api public method=POST path=/bills/:id/line-items
@@ -94,10 +95,10 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 			Message: "description is required",
 		}
 	}
-	if req.AmountMinor <= 0 {
+	if !req.Amount.IsPositive() {
 		return nil, &errs.Error{
 			Code:    errs.InvalidArgument,
-			Message: "amountMinor must be positive",
+			Message: "amount must be positive",
 		}
 	}
 	currency := Currency(req.Currency)
@@ -118,7 +119,7 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 	in := AddLineItemInput{
 		ItemID:      itemID,
 		Description: req.Description,
-		AmountMinor: req.AmountMinor,
+		Amount:      req.Amount,
 		Currency:    currency,
 	}
 
@@ -167,12 +168,12 @@ func classifyUpdateError(err error) *errs.Error {
 }
 
 type CloseBillResponse struct {
-	BillID      string     `json:"billId"`
-	Status      string     `json:"status"`
-	TotalAmount int64      `json:"totalAmount"`
-	Currency    string     `json:"currency"`
-	LineItems   []LineItem `json:"lineItems"`
-	ClosedAt    string     `json:"closedAt"`
+	BillID      string          `json:"billId"`
+	Status      string          `json:"status"`
+	TotalAmount decimal.Decimal `json:"totalAmount"`
+	Currency    string          `json:"currency"`
+	LineItems   []LineItem      `json:"lineItems"`
+	ClosedAt    string          `json:"closedAt"`
 }
 
 //encore:api public method=POST path=/bills/:id/close
@@ -326,7 +327,7 @@ func (s *Service) getBillFromDB(ctx context.Context, id string) (Bill, error) {
 	}
 
 	rows, err := db.Query(ctx, `
-		SELECT id, description, amount_minor, currency, created_at
+		SELECT id, description, amount, currency, created_at
 		FROM line_items WHERE bill_id = $1 ORDER BY created_at`, id)
 	if err != nil {
 		return Bill{}, err
@@ -336,12 +337,9 @@ func (s *Service) getBillFromDB(ctx context.Context, id string) (Bill, error) {
 	b.LineItems = []LineItem{}
 	for rows.Next() {
 		var item LineItem
-		var amountMinor int64
-		var cur Currency
-		if err := rows.Scan(&item.ID, &item.Description, &amountMinor, &cur, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Description, &item.Amount, &item.Currency, &item.CreatedAt); err != nil {
 			return Bill{}, fmt.Errorf("scan line item: %w", err)
 		}
-		item.Amount = Money{Amount: amountMinor, Currency: cur}
 		b.LineItems = append(b.LineItems, item)
 	}
 	if err := rows.Err(); err != nil {

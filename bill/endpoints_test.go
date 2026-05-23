@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -23,7 +24,7 @@ func (m *mockQueryResult) Get(valuePtr interface{}) error {
 			Status:      BillStatusOpen,
 			Currency:    CurrencyUSD,
 			LineItems:   []LineItem{},
-			TotalAmount: 0,
+			TotalAmount: decimal.Zero,
 		}
 	}
 	return args.Error(0)
@@ -82,22 +83,22 @@ func TestAddLineItem_InvalidInput(t *testing.T) {
 	}{
 		{
 			name:    "empty description",
-			req:     &AddLineItemRequest{Description: "", AmountMinor: 1000, Currency: "USD"},
+			req:     &AddLineItemRequest{Description: "", Amount: decimal.NewFromInt(10), Currency: "USD"},
 			wantErr: "description is required",
 		},
 		{
 			name:    "zero amount",
-			req:     &AddLineItemRequest{Description: "Fee", AmountMinor: 0, Currency: "USD"},
-			wantErr: "amountMinor must be positive",
+			req:     &AddLineItemRequest{Description: "Fee", Amount: decimal.Zero, Currency: "USD"},
+			wantErr: "amount must be positive",
 		},
 		{
 			name:    "negative amount",
-			req:     &AddLineItemRequest{Description: "Fee", AmountMinor: -100, Currency: "USD"},
-			wantErr: "amountMinor must be positive",
+			req:     &AddLineItemRequest{Description: "Fee", Amount: decimal.NewFromInt(-1), Currency: "USD"},
+			wantErr: "amount must be positive",
 		},
 		{
-			name:    "invalid currency",
-			req:     &AddLineItemRequest{Description: "Fee", AmountMinor: 1000, Currency: "EUR"},
+			name:    "unsupported currency",
+			req:     &AddLineItemRequest{Description: "Fee", Amount: decimal.NewFromInt(10), Currency: "XYZ"},
 			wantErr: "invalid currency",
 		},
 	}
@@ -122,7 +123,7 @@ func TestAddLineItem_ClosedBill(t *testing.T) {
 
 	_, err := svc.AddLineItem(context.Background(), "closed-bill", &AddLineItemRequest{
 		Description: "Fee",
-		AmountMinor: 1000,
+		Amount:      decimal.NewFromInt(10),
 		Currency:    "USD",
 	})
 
@@ -189,10 +190,13 @@ func TestMoney_DisplayAmount(t *testing.T) {
 		m    Money
 		want string
 	}{
-		{name: "USD whole", m: Money{Amount: 1000, Currency: CurrencyUSD}, want: "10.00 USD"},
-		{name: "USD cents", m: Money{Amount: 1050, Currency: CurrencyUSD}, want: "10.50 USD"},
-		{name: "GEL", m: Money{Amount: 2575, Currency: CurrencyGEL}, want: "25.75 GEL"},
-		{name: "zero", m: Money{Amount: 0, Currency: CurrencyUSD}, want: "0.00 USD"},
+		{name: "USD whole", m: Money{Amount: decimal.NewFromInt(10), Currency: "USD"}, want: "10.00 USD"},
+		{name: "USD cents", m: Money{Amount: decimal.RequireFromString("10.50"), Currency: "USD"}, want: "10.50 USD"},
+		{name: "GEL", m: Money{Amount: decimal.RequireFromString("25.75"), Currency: "GEL"}, want: "25.75 GEL"},
+		{name: "zero USD", m: Money{Amount: decimal.Zero, Currency: "USD"}, want: "0.00 USD"},
+		{name: "JPY rounds to whole", m: Money{Amount: decimal.RequireFromString("1234.56"), Currency: "JPY"}, want: "1235 JPY"},
+		{name: "BHD three decimals", m: Money{Amount: decimal.RequireFromString("12.345"), Currency: "BHD"}, want: "12.345 BHD"},
+		{name: "negative below unit", m: Money{Amount: decimal.RequireFromString("-0.50"), Currency: "USD"}, want: "-0.50 USD"},
 	}
 
 	for _, tt := range tests {
@@ -203,10 +207,18 @@ func TestMoney_DisplayAmount(t *testing.T) {
 }
 
 func TestCurrency_Valid(t *testing.T) {
-	assert.True(t, CurrencyUSD.Valid())
-	assert.True(t, CurrencyGEL.Valid())
-	assert.False(t, Currency("EUR").Valid())
-	assert.False(t, Currency("").Valid())
+	for _, code := range []Currency{"USD", "EUR", "GBP", "GEL", "JPY", "KRW", "BHD", "KWD"} {
+		assert.Truef(t, code.Valid(), "%s should be valid", code)
+	}
+	for _, code := range []Currency{"XYZ", "", "us"} {
+		assert.Falsef(t, code.Valid(), "%s should be invalid", code)
+	}
+}
+
+func TestCurrency_Decimals(t *testing.T) {
+	assert.Equal(t, int32(2), Currency("USD").Decimals())
+	assert.Equal(t, int32(0), Currency("JPY").Decimals())
+	assert.Equal(t, int32(3), Currency("BHD").Decimals())
 }
 
 // Verify that mocks.Client satisfies the client.Client interface at compile time.

@@ -37,10 +37,10 @@ func PersistBillActivity(ctx context.Context, bill Bill) error {
 
 	for _, item := range bill.LineItems {
 		_, err = tx.Exec(ctx, `
-			INSERT INTO line_items (id, bill_id, description, amount_minor, currency, created_at)
+			INSERT INTO line_items (id, bill_id, description, amount, currency, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (id) DO NOTHING`,
-			item.ID, bill.ID, item.Description, item.Amount.Amount, string(item.Amount.Currency), item.CreatedAt,
+			item.ID, bill.ID, item.Description, item.Amount, string(item.Currency), item.CreatedAt,
 		)
 		if err != nil {
 			return fmt.Errorf("insert line item %s: %w", item.ID, err)

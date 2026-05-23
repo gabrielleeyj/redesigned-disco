@@ -3,21 +3,55 @@ package bill
 import (
 	"fmt"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 type Currency string
 
+type CurrencyMeta struct {
+	Code     string
+	Decimals int32
+	Symbol   string
+}
+
+// currencies is the registry of supported ISO-4217 currencies. Add entries
+// here to enable new currencies; everything else (validation, display,
+// rounding) reads from this table.
+var currencies = map[Currency]CurrencyMeta{
+	"USD": {Code: "USD", Decimals: 2, Symbol: "$"},
+	"EUR": {Code: "EUR", Decimals: 2, Symbol: "€"},
+	"GBP": {Code: "GBP", Decimals: 2, Symbol: "£"},
+	"GEL": {Code: "GEL", Decimals: 2, Symbol: "₾"},
+	"JPY": {Code: "JPY", Decimals: 0, Symbol: "¥"},
+	"KRW": {Code: "KRW", Decimals: 0, Symbol: "₩"},
+	"BHD": {Code: "BHD", Decimals: 3, Symbol: ".د.ب"},
+	"KWD": {Code: "KWD", Decimals: 3, Symbol: "د.ك"},
+}
+
+// Compatibility shims for the original API. New code should use the registry.
 const (
 	CurrencyUSD Currency = "USD"
 	CurrencyGEL Currency = "GEL"
 )
 
-func (c Currency) Valid() bool {
-	return c == CurrencyUSD || c == CurrencyGEL
+func (c Currency) Meta() (CurrencyMeta, bool) {
+	meta, ok := currencies[c]
+	return meta, ok
 }
 
-func (c Currency) MinorUnitFactor() int64 {
-	return 100
+func (c Currency) Valid() bool {
+	_, ok := currencies[c]
+	return ok
+}
+
+// Decimals returns the ISO-4217 fractional digit count for the currency.
+// Falls back to 2 for unknown codes; callers should also check Valid().
+func (c Currency) Decimals() int32 {
+	if meta, ok := currencies[c]; ok {
+		return meta.Decimals
+	}
+	return 2
 }
 
 type BillStatus string
@@ -27,37 +61,42 @@ const (
 	BillStatusClosed BillStatus = "CLOSED"
 )
 
+// Money carries an arbitrary-precision decimal amount tagged with a currency.
+// Persistence and arithmetic preserve full precision; rounding is applied at
+// display boundaries only.
 type Money struct {
-	Amount   int64    `json:"amount"`
-	Currency Currency `json:"currency"`
+	Amount   decimal.Decimal `json:"amount"`
+	Currency Currency        `json:"currency"`
 }
 
+func NewMoney(amount decimal.Decimal, currency Currency) Money {
+	return Money{Amount: amount, Currency: currency}
+}
+
+// DisplayAmount renders the value rounded to the currency's standard
+// fractional digits. Use this for human-facing output only; never for
+// further computation.
 func (m Money) DisplayAmount() string {
-	factor := m.Currency.MinorUnitFactor()
-	abs := m.Amount
-	sign := ""
-	if abs < 0 {
-		sign = "-"
-		abs = -abs
-	}
-	return fmt.Sprintf("%s%d.%02d %s", sign, abs/factor, abs%factor, m.Currency)
+	decimals := m.Currency.Decimals()
+	return fmt.Sprintf("%s %s", m.Amount.StringFixed(decimals), m.Currency)
 }
 
 type LineItem struct {
-	ID          string    `json:"id"`
-	Description string    `json:"description"`
-	Amount      Money     `json:"amount"`
-	CreatedAt   time.Time `json:"createdAt"`
+	ID          string          `json:"id"`
+	Description string          `json:"description"`
+	Amount      decimal.Decimal `json:"amount"`
+	Currency    Currency        `json:"currency"`
+	CreatedAt   time.Time       `json:"createdAt"`
 }
 
 type Bill struct {
-	ID          string     `json:"id"`
-	Status      BillStatus `json:"status"`
-	Currency    Currency   `json:"currency"`
-	LineItems   []LineItem `json:"lineItems"`
-	TotalAmount int64      `json:"totalAmount"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	ClosedAt    *time.Time `json:"closedAt,omitempty"`
+	ID          string          `json:"id"`
+	Status      BillStatus      `json:"status"`
+	Currency    Currency        `json:"currency"`
+	LineItems   []LineItem      `json:"lineItems"`
+	TotalAmount decimal.Decimal `json:"totalAmount"`
+	CreatedAt   time.Time       `json:"createdAt"`
+	ClosedAt    *time.Time      `json:"closedAt,omitempty"`
 }
 
 type BillWorkflowInput struct {
@@ -69,8 +108,8 @@ type BillWorkflowInput struct {
 }
 
 type BillResult struct {
-	BillID      string   `json:"billId"`
-	TotalAmount int64    `json:"totalAmount"`
-	Currency    Currency `json:"currency"`
-	ItemCount   int      `json:"itemCount"`
+	BillID      string          `json:"billId"`
+	TotalAmount decimal.Decimal `json:"totalAmount"`
+	Currency    Currency        `json:"currency"`
+	ItemCount   int             `json:"itemCount"`
 }

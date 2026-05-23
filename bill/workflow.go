@@ -39,8 +39,8 @@ func BillingWorkflow(ctx workflow.Context, input BillWorkflowInput) (BillResult,
 				if in.Currency != bill.Currency {
 					return fmt.Errorf("currency mismatch: bill is %s, item is %s", bill.Currency, in.Currency)
 				}
-				if in.AmountMinor <= 0 {
-					return fmt.Errorf("amountMinor must be positive")
+				if !in.Amount.IsPositive() {
+					return fmt.Errorf("amount must be positive")
 				}
 				if in.Description == "" {
 					return fmt.Errorf("description is required")
@@ -129,12 +129,10 @@ func handleAddLineItem(bill *Bill, seen map[string]struct{}, in AddLineItemInput
 	bill.LineItems = append(bill.LineItems, LineItem{
 		ID:          in.ItemID,
 		Description: in.Description,
-		Amount: Money{
-			Amount:   in.AmountMinor,
-			Currency: in.Currency,
-		},
-		CreatedAt: now,
+		Amount:      in.Amount,
+		Currency:    in.Currency,
+		CreatedAt:   now,
 	})
-	bill.TotalAmount += in.AmountMinor
+	bill.TotalAmount = bill.TotalAmount.Add(in.Amount)
 	seen[in.ItemID] = struct{}{}
 }

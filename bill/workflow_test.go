@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -17,60 +18,72 @@ type addStep struct {
 	wantRejected bool
 }
 
+func dec(s string) decimal.Decimal { return decimal.RequireFromString(s) }
+
 func TestBillingWorkflow(t *testing.T) {
 	tests := []struct {
 		name      string
 		input     BillWorkflowInput
 		adds      []addStep
-		wantTotal int64
+		wantTotal decimal.Decimal
 		wantItems int
 	}{
 		{
 			name:      "create and close empty bill",
 			input:     BillWorkflowInput{BillID: "bill-1", Currency: CurrencyUSD},
 			adds:      nil,
-			wantTotal: 0,
+			wantTotal: decimal.Zero,
 			wantItems: 0,
 		},
 		{
 			name:  "add three items then close",
 			input: BillWorkflowInput{BillID: "bill-2", Currency: CurrencyUSD},
 			adds: []addStep{
-				{in: AddLineItemInput{ItemID: "i1", Description: "Fee A", AmountMinor: 1000, Currency: CurrencyUSD}},
-				{in: AddLineItemInput{ItemID: "i2", Description: "Fee B", AmountMinor: 2500, Currency: CurrencyUSD}},
-				{in: AddLineItemInput{ItemID: "i3", Description: "Fee C", AmountMinor: 500, Currency: CurrencyUSD}},
+				{in: AddLineItemInput{ItemID: "i1", Description: "Fee A", Amount: dec("10.00"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{ItemID: "i2", Description: "Fee B", Amount: dec("25.00"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{ItemID: "i3", Description: "Fee C", Amount: dec("5.00"), Currency: CurrencyUSD}},
 			},
-			wantTotal: 4000,
+			wantTotal: dec("40.00"),
 			wantItems: 3,
+		},
+		{
+			name:  "sub-cent precision preserved across additions",
+			input: BillWorkflowInput{BillID: "bill-precise", Currency: "USD"},
+			adds: []addStep{
+				{in: AddLineItemInput{ItemID: "p1", Description: "Micro fee", Amount: dec("0.0001"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{ItemID: "p2", Description: "Interest", Amount: dec("0.123456789"), Currency: CurrencyUSD}},
+			},
+			wantTotal: dec("0.123556789"),
+			wantItems: 2,
 		},
 		{
 			name:  "wrong currency item rejected by validator",
 			input: BillWorkflowInput{BillID: "bill-3", Currency: CurrencyUSD},
 			adds: []addStep{
-				{in: AddLineItemInput{ItemID: "i1", Description: "Valid", AmountMinor: 1000, Currency: CurrencyUSD}},
-				{in: AddLineItemInput{ItemID: "i2", Description: "Invalid GEL", AmountMinor: 500, Currency: CurrencyGEL}, wantRejected: true},
+				{in: AddLineItemInput{ItemID: "i1", Description: "Valid", Amount: dec("10.00"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{ItemID: "i2", Description: "Invalid GEL", Amount: dec("5.00"), Currency: CurrencyGEL}, wantRejected: true},
 			},
-			wantTotal: 1000,
+			wantTotal: dec("10.00"),
 			wantItems: 1,
 		},
 		{
 			name:  "idempotent - duplicate item ID ignored",
 			input: BillWorkflowInput{BillID: "bill-4", Currency: CurrencyUSD},
 			adds: []addStep{
-				{in: AddLineItemInput{ItemID: "dup", Description: "First", AmountMinor: 1000, Currency: CurrencyUSD}},
-				{in: AddLineItemInput{ItemID: "dup", Description: "Duplicate", AmountMinor: 1000, Currency: CurrencyUSD}},
+				{in: AddLineItemInput{ItemID: "dup", Description: "First", Amount: dec("10.00"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{ItemID: "dup", Description: "Duplicate", Amount: dec("10.00"), Currency: CurrencyUSD}},
 			},
-			wantTotal: 1000,
+			wantTotal: dec("10.00"),
 			wantItems: 1,
 		},
 		{
-			name:  "GEL bill works independently",
-			input: BillWorkflowInput{BillID: "bill-5", Currency: CurrencyGEL},
+			name:  "JPY bill (zero decimals) works",
+			input: BillWorkflowInput{BillID: "bill-jpy", Currency: "JPY"},
 			adds: []addStep{
-				{in: AddLineItemInput{ItemID: "g1", Description: "GEL Fee", AmountMinor: 3000, Currency: CurrencyGEL}},
-				{in: AddLineItemInput{ItemID: "g2", Description: "GEL Fee 2", AmountMinor: 1500, Currency: CurrencyGEL}},
+				{in: AddLineItemInput{ItemID: "j1", Description: "Yen fee", Amount: dec("1000"), Currency: "JPY"}},
+				{in: AddLineItemInput{ItemID: "j2", Description: "Yen fee 2", Amount: dec("500"), Currency: "JPY"}},
 			},
-			wantTotal: 4500,
+			wantTotal: dec("1500"),
 			wantItems: 2,
 		},
 	}
@@ -107,7 +120,7 @@ func TestBillingWorkflow(t *testing.T) {
 			require.NoError(t, env.GetWorkflowResult(&result))
 
 			assert.Equal(t, tt.input.BillID, result.BillID)
-			assert.Equal(t, tt.wantTotal, result.TotalAmount)
+			assert.True(t, tt.wantTotal.Equal(result.TotalAmount), "want %s got %s", tt.wantTotal, result.TotalAmount)
 			assert.Equal(t, tt.wantItems, result.ItemCount)
 			assert.Equal(t, tt.input.Currency, result.Currency)
 		})
