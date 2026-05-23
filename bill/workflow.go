@@ -1,6 +1,7 @@
 package bill
 
 import (
+	"fmt"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
@@ -16,25 +17,47 @@ func BillingWorkflow(ctx workflow.Context, input BillWorkflowInput) (BillResult,
 		seen[item.ID] = struct{}{}
 	}
 
-	err := workflow.SetQueryHandler(ctx, QueryBillState, func() (Bill, error) {
+	if err := workflow.SetQueryHandler(ctx, QueryBillState, func() (Bill, error) {
 		return bill, nil
-	})
+	}); err != nil {
+		return BillResult{}, err
+	}
+
+	err := workflow.SetUpdateHandlerWithOptions(
+		ctx,
+		UpdateAddLineItem,
+		func(ctx workflow.Context, in AddLineItemInput) (AddLineItemResult, error) {
+			handleAddLineItem(&bill, seen, in, workflow.Now(ctx))
+			return AddLineItemResult{
+				ItemID:    in.ItemID,
+				BillTotal: bill.TotalAmount,
+				ItemCount: len(bill.LineItems),
+			}, nil
+		},
+		workflow.UpdateHandlerOptions{
+			Validator: func(ctx workflow.Context, in AddLineItemInput) error {
+				if in.Currency != bill.Currency {
+					return fmt.Errorf("currency mismatch: bill is %s, item is %s", bill.Currency, in.Currency)
+				}
+				if in.AmountMinor <= 0 {
+					return fmt.Errorf("amountMinor must be positive")
+				}
+				if in.Description == "" {
+					return fmt.Errorf("description is required")
+				}
+				return nil
+			},
+		},
+	)
 	if err != nil {
 		return BillResult{}, err
 	}
 
-	addItemCh := workflow.GetSignalChannel(ctx, SignalAddLineItem)
 	closeCh := workflow.GetSignalChannel(ctx, SignalCloseBill)
 
 	closed := false
 	for !closed {
 		selector := workflow.NewSelector(ctx)
-
-		selector.AddReceive(addItemCh, func(c workflow.ReceiveChannel, more bool) {
-			var signal AddLineItemSignal
-			c.Receive(ctx, &signal)
-			handleAddLineItem(&bill, seen, signal, workflow.Now(ctx))
-		})
 
 		selector.AddReceive(closeCh, func(c workflow.ReceiveChannel, more bool) {
 			var signal CloseBillSignal
@@ -54,7 +77,11 @@ func BillingWorkflow(ctx workflow.Context, input BillWorkflowInput) (BillResult,
 		}
 	}
 
-	drainSignals(ctx, addItemCh, &bill, seen)
+	if err := workflow.Await(ctx, func() bool {
+		return workflow.AllHandlersFinished(ctx)
+	}); err != nil {
+		return BillResult{}, fmt.Errorf("await pending updates: %w", err)
+	}
 
 	now := workflow.Now(ctx)
 	bill.Status = BillStatusClosed
@@ -70,8 +97,7 @@ func BillingWorkflow(ctx workflow.Context, input BillWorkflowInput) (BillResult,
 			MaximumAttempts:    5,
 		},
 	})
-	err = workflow.ExecuteActivity(activityCtx, PersistBillActivity, bill).Get(ctx, nil)
-	if err != nil {
+	if err := workflow.ExecuteActivity(activityCtx, PersistBillActivity, bill).Get(ctx, nil); err != nil {
 		return BillResult{}, err
 	}
 
@@ -96,36 +122,19 @@ func initialBill(ctx workflow.Context, input BillWorkflowInput) Bill {
 	}
 }
 
-func handleAddLineItem(bill *Bill, seen map[string]struct{}, signal AddLineItemSignal, now time.Time) {
-	if signal.Currency != bill.Currency {
+func handleAddLineItem(bill *Bill, seen map[string]struct{}, in AddLineItemInput, now time.Time) {
+	if _, dup := seen[in.ItemID]; dup {
 		return
 	}
-	if _, dup := seen[signal.ItemID]; dup {
-		return
-	}
-
-	item := LineItem{
-		ID:          signal.ItemID,
-		Description: signal.Description,
+	bill.LineItems = append(bill.LineItems, LineItem{
+		ID:          in.ItemID,
+		Description: in.Description,
 		Amount: Money{
-			Amount:   signal.AmountMinor,
-			Currency: signal.Currency,
+			Amount:   in.AmountMinor,
+			Currency: in.Currency,
 		},
 		CreatedAt: now,
-	}
-
-	bill.LineItems = append(bill.LineItems, item)
-	bill.TotalAmount += signal.AmountMinor
-	seen[signal.ItemID] = struct{}{}
-}
-
-func drainSignals(ctx workflow.Context, ch workflow.ReceiveChannel, bill *Bill, seen map[string]struct{}) {
-	for {
-		var signal AddLineItemSignal
-		ok := ch.ReceiveAsync(&signal)
-		if !ok {
-			break
-		}
-		handleAddLineItem(bill, seen, signal, workflow.Now(ctx))
-	}
+	})
+	bill.TotalAmount += in.AmountMinor
+	seen[in.ItemID] = struct{}{}
 }

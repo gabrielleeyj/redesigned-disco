@@ -115,13 +115,10 @@ func TestAddLineItem_InvalidInput(t *testing.T) {
 func TestAddLineItem_ClosedBill(t *testing.T) {
 	svc, mockClient := newTestService(t)
 
-	mockClient.On("SignalWorkflow",
+	mockClient.On("UpdateWorkflow",
 		mock.Anything,
-		"bill-closed-bill",
-		"",
-		SignalAddLineItem,
-		mock.Anything,
-	).Return(assert.AnError)
+		mock.AnythingOfType("client.UpdateWorkflowOptions"),
+	).Return((*mocks.WorkflowUpdateHandle)(nil), assert.AnError)
 
 	_, err := svc.AddLineItem(context.Background(), "closed-bill", &AddLineItemRequest{
 		Description: "Fee",

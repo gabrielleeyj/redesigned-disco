@@ -115,34 +115,55 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 
 	workflowID := fmt.Sprintf("bill-%s", id)
 
-	signal := AddLineItemSignal{
+	in := AddLineItemInput{
 		ItemID:      itemID,
 		Description: req.Description,
 		AmountMinor: req.AmountMinor,
 		Currency:    currency,
 	}
 
-	err := s.temporalClient.SignalWorkflow(ctx, workflowID, emptyRunID, SignalAddLineItem, signal)
+	handle, err := s.temporalClient.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
+		WorkflowID:   workflowID,
+		RunID:        emptyRunID,
+		UpdateName:   UpdateAddLineItem,
+		Args:         []interface{}{in},
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+	})
 	if err != nil {
-		return nil, &errs.Error{
-			Code:    errs.FailedPrecondition,
-			Message: "cannot add item: bill is closed or not found",
-		}
+		return nil, mapTemporalRPCError(err, "add item")
 	}
 
-	state, err := s.queryBillState(ctx, workflowID)
-	if err != nil {
-		return nil, &errs.Error{
-			Code:    errs.Internal,
-			Message: fmt.Sprintf("item %s added but bill state unavailable: %v", itemID, err),
-		}
+	var result AddLineItemResult
+	if err := handle.Get(ctx, &result); err != nil {
+		return nil, classifyUpdateError(err)
 	}
 
 	return &AddLineItemResponse{
-		ItemID:    itemID,
-		BillTotal: state.TotalAmount,
-		ItemCount: len(state.LineItems),
+		ItemID:    result.ItemID,
+		BillTotal: result.BillTotal,
+		ItemCount: result.ItemCount,
 	}, nil
+}
+
+func mapTemporalRPCError(err error, op string) *errs.Error {
+	var notFound *serviceerror.NotFound
+	if errors.As(err, &notFound) {
+		return &errs.Error{
+			Code:    errs.NotFound,
+			Message: fmt.Sprintf("cannot %s: bill not found", op),
+		}
+	}
+	return &errs.Error{
+		Code:    errs.FailedPrecondition,
+		Message: fmt.Sprintf("cannot %s: bill is closed or not found", op),
+	}
+}
+
+func classifyUpdateError(err error) *errs.Error {
+	return &errs.Error{
+		Code:    errs.InvalidArgument,
+		Message: err.Error(),
+	}
 }
 
 type CloseBillResponse struct {
@@ -158,18 +179,12 @@ type CloseBillResponse struct {
 func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse, error) {
 	workflowID := fmt.Sprintf("bill-%s", id)
 
-	err := s.temporalClient.SignalWorkflow(ctx, workflowID, emptyRunID, SignalCloseBill, CloseBillSignal{})
-	if err != nil {
-		return nil, &errs.Error{
-			Code:    errs.FailedPrecondition,
-			Message: "cannot close bill: already closed or not found",
-		}
+	if err := s.temporalClient.SignalWorkflow(ctx, workflowID, emptyRunID, SignalCloseBill, CloseBillSignal{}); err != nil {
+		return nil, mapTemporalRPCError(err, "close bill")
 	}
 
-	var result BillResult
 	run := s.temporalClient.GetWorkflow(ctx, workflowID, emptyRunID)
-	err = run.Get(ctx, &result)
-	if err != nil {
+	if err := run.Get(ctx, nil); err != nil {
 		return nil, &errs.Error{
 			Code:    errs.Internal,
 			Message: "failed to get bill result",
