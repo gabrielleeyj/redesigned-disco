@@ -7,8 +7,12 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// Currency is an ISO-4217 alphabetic code. Validity is determined at
+// runtime by the registry loaded from the currencies table, not by a
+// hardcoded enum.
 type Currency string
 
+// CurrencyMeta is one row from the currencies table.
 type CurrencyMeta struct {
 	Code        string
 	Name        string
@@ -22,11 +26,13 @@ const (
 	CurrencyGEL Currency = "GEL"
 )
 
+// Meta returns the registry entry for c if the currency is supported.
 func (c Currency) Meta() (CurrencyMeta, bool) {
 	meta, ok := getCurrencies()[c]
 	return meta, ok
 }
 
+// Valid reports whether c is in the registry.
 func (c Currency) Valid() bool {
 	_, ok := getCurrencies()[c]
 	return ok
@@ -41,10 +47,13 @@ func (c Currency) Decimals() int32 {
 	return 2
 }
 
+// BillStatus is the lifecycle state of a Bill.
 type BillStatus string
 
 const (
-	BillStatusOpen   BillStatus = "OPEN"
+	// BillStatusOpen indicates the bill is accepting line items.
+	BillStatusOpen BillStatus = "OPEN"
+	// BillStatusClosed indicates the bill has been finalised and persisted.
 	BillStatusClosed BillStatus = "CLOSED"
 )
 
@@ -56,6 +65,7 @@ type Money struct {
 	Currency Currency        `json:"currency"`
 }
 
+// NewMoney constructs a Money value.
 func NewMoney(amount decimal.Decimal, currency Currency) Money {
 	return Money{Amount: amount, Currency: currency}
 }
@@ -68,6 +78,8 @@ func (m Money) DisplayAmount() string {
 	return fmt.Sprintf("%s %s", m.Amount.StringFixed(decimals), m.Currency)
 }
 
+// LineItem is a single charge on a Bill. Amount is in the bill's currency
+// at full precision; rounding for display happens at the boundary.
 type LineItem struct {
 	ID          string          `json:"id"`
 	Description string          `json:"description"`
@@ -76,6 +88,9 @@ type LineItem struct {
 	CreatedAt   time.Time       `json:"createdAt"`
 }
 
+// Bill is the aggregate root: an open or closed bill with its line items
+// and running total. The workflow holds this as in-memory state; the
+// activity persists it on close.
 type Bill struct {
 	ID          string          `json:"id"`
 	Status      BillStatus      `json:"status"`
@@ -86,6 +101,7 @@ type Bill struct {
 	ClosedAt    *time.Time      `json:"closedAt,omitempty"`
 }
 
+// BillWorkflowInput is the argument to BillingWorkflow.
 type BillWorkflowInput struct {
 	BillID   string   `json:"billId"`
 	Currency Currency `json:"currency"`
@@ -94,6 +110,7 @@ type BillWorkflowInput struct {
 	Snapshot *Bill `json:"snapshot,omitempty"`
 }
 
+// BillResult is the value returned by BillingWorkflow on completion.
 type BillResult struct {
 	BillID      string          `json:"billId"`
 	TotalAmount decimal.Decimal `json:"totalAmount"`

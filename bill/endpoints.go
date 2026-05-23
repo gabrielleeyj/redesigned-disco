@@ -6,10 +6,12 @@ import (
 	"fmt"
 
 	"encore.dev/beta/errs"
+	"encore.dev/rlog"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 )
 
 // emptyRunID targets the latest run of a workflow ID. Required when the
@@ -160,10 +162,38 @@ func mapTemporalRPCError(err error, op string) *errs.Error {
 	}
 }
 
+// classifyUpdateError maps the outcome of a Temporal update handle's Get
+// onto Encore error codes. Validator rejections surface as ApplicationError
+// (-> InvalidArgument). Timeouts and canceled-by-server surface as
+// DeadlineExceeded. Everything else is treated as Internal and logged so
+// infrastructure failures are not silently presented to callers as
+// validation errors.
 func classifyUpdateError(err error) *errs.Error {
+	var appErr *temporal.ApplicationError
+	if errors.As(err, &appErr) {
+		return &errs.Error{
+			Code:    errs.InvalidArgument,
+			Message: appErr.Message(),
+		}
+	}
+	var timeoutErr *temporal.TimeoutError
+	if errors.As(err, &timeoutErr) {
+		return &errs.Error{
+			Code:    errs.DeadlineExceeded,
+			Message: "add item timed out",
+		}
+	}
+	var canceledErr *temporal.CanceledError
+	if errors.As(err, &canceledErr) {
+		return &errs.Error{
+			Code:    errs.Canceled,
+			Message: "add item canceled",
+		}
+	}
+	rlog.Error("temporal update failed", "err", err)
 	return &errs.Error{
-		Code:    errs.InvalidArgument,
-		Message: err.Error(),
+		Code:    errs.Internal,
+		Message: "failed to add item",
 	}
 }
 
@@ -184,11 +214,13 @@ func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse,
 		return nil, mapTemporalRPCError(err, "close bill")
 	}
 
+	var result BillResult
 	run := s.temporalClient.GetWorkflow(ctx, workflowID, emptyRunID)
-	if err := run.Get(ctx, nil); err != nil {
+	if err := run.Get(ctx, &result); err != nil {
+		rlog.Error("close bill workflow failed", "bill_id", id, "err", err)
 		return nil, &errs.Error{
 			Code:    errs.Internal,
-			Message: "failed to get bill result",
+			Message: "failed to close bill",
 		}
 	}
 
@@ -227,6 +259,11 @@ func (s *Service) GetBill(ctx context.Context, id string) (*GetBillResponse, err
 	if err == nil {
 		return &GetBillResponse{Bill: state}, nil
 	}
+	// Workflow query failed — likely the workflow has completed and history
+	// has been GC'd, in which case the DB read below is authoritative. We
+	// log so a transient infra error (cancelled context, network blip) does
+	// not silently degrade to a DB read without a trace.
+	rlog.Debug("bill workflow query failed, falling back to DB", "bill_id", id, "err", err)
 
 	bill, err := s.getBillFromDB(ctx, id)
 	if err != nil {
@@ -252,6 +289,12 @@ type ListBillsResponse struct {
 
 //encore:api public method=GET path=/bills
 func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBillsResponse, error) {
+	if req != nil && (req.Limit < 0 || req.Offset < 0) {
+		return nil, &errs.Error{
+			Code:    errs.InvalidArgument,
+			Message: "limit and offset must be non-negative",
+		}
+	}
 	limit, offset := normalizeListPagination(req)
 
 	rows, err := db.Query(ctx, `

@@ -8,6 +8,7 @@ import (
 
 	"encore.dev/rlog"
 	"github.com/hashicorp/golang-lru/v2/expirable"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -24,25 +25,48 @@ var currencyCache = expirable.NewLRU[string, map[Currency]CurrencyMeta](
 	1, nil, currenciesCacheTTL,
 )
 
+// currencyLoadGroup deduplicates concurrent cache-miss reloads so a TTL
+// expiry under load triggers exactly one DB round-trip, not N. Without
+// this, the read path is vulnerable to a thundering herd.
+var currencyLoadGroup singleflight.Group
+
 // getCurrencies returns the registry, refilling from the DB on a cache
 // miss (cold start or TTL expiry). Returns nil on DB error; callers
 // (Currency.Valid, .Decimals, .Meta) interpret a nil map as "no
 // currencies known" — i.e., everything is invalid. That is the
 // fail-closed behaviour we want; a transient DB outage should reject
 // unknown amounts rather than admit them.
+//
+// Note: this function is NEVER called from inside a Temporal workflow
+// — doing so would break replay determinism. Workflows must validate
+// currencies via state captured at workflow start (input.Currency on
+// the bill).
 func getCurrencies() map[Currency]CurrencyMeta {
 	if m, ok := currencyCache.Get(currenciesCacheKey); ok {
 		return m
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), currencyLoadTimeout)
-	defer cancel()
-	m, err := loadCurrenciesFromDB(ctx)
+
+	v, err, _ := currencyLoadGroup.Do(currenciesCacheKey, func() (interface{}, error) {
+		if m, ok := currencyCache.Get(currenciesCacheKey); ok {
+			return m, nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), currencyLoadTimeout)
+		defer cancel()
+		m, err := loadCurrenciesFromDB(ctx)
+		if err != nil {
+			return nil, err
+		}
+		currencyCache.Add(currenciesCacheKey, m)
+		return m, nil
+	})
 	if err != nil {
 		rlog.Error("currency cache miss reload failed", "err", err)
 		return nil
 	}
-	currencyCache.Add(currenciesCacheKey, m)
-	return m
+	if v == nil {
+		return nil
+	}
+	return v.(map[Currency]CurrencyMeta)
 }
 
 // setCurrencies primes the cache. Called by initService after the eager

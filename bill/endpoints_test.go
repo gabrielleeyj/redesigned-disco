@@ -118,7 +118,7 @@ func TestAddLineItem_ClosedBill(t *testing.T) {
 
 	mockClient.On("UpdateWorkflow",
 		mock.Anything,
-		mock.AnythingOfType("client.UpdateWorkflowOptions"),
+		mock.AnythingOfType("internal.UpdateWorkflowOptions"),
 	).Return((*mocks.WorkflowUpdateHandle)(nil), assert.AnError)
 
 	_, err := svc.AddLineItem(context.Background(), "closed-bill", &AddLineItemRequest{

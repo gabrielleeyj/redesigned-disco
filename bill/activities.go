@@ -7,6 +7,10 @@ import (
 	"encore.dev/rlog"
 )
 
+// PersistBillActivity writes the closed bill and its line items to the DB
+// inside a single transaction. Uses ON CONFLICT upserts so retries are
+// idempotent — the activity's retry policy may invoke it more than once
+// for the same bill.
 func PersistBillActivity(ctx context.Context, bill Bill) error {
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -47,9 +51,12 @@ func PersistBillActivity(ctx context.Context, bill Bill) error {
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
+	err = tx.Commit()
+	// Set committed before any return below so a panic between Commit and
+	// here does not cause the defer to roll back an already-committed tx.
+	committed = err == nil
+	if err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
-	committed = true
 	return nil
 }

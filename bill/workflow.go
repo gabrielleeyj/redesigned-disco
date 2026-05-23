@@ -8,8 +8,19 @@ import (
 	"go.temporal.io/sdk/workflow"
 )
 
+// continueAsNewThreshold caps the number of line items per workflow run.
+// Once the limit is hit, the workflow continues-as-new with a snapshot of
+// state, keeping per-run history bounded.
 const continueAsNewThreshold = 1000
 
+// BillingWorkflow is the Temporal workflow that backs a bill's lifecycle.
+// It accumulates line items via the AddLineItem update, completes on the
+// CloseBill signal, and persists the final state via PersistBillActivity.
+//
+// Replay-determinism note: this workflow MUST NOT call getCurrencies() or
+// touch any other runtime-mutable state. Currency validation is the
+// endpoint's responsibility; the workflow only enforces that incoming
+// items match the bill's locked-in currency (captured at start).
 func BillingWorkflow(ctx workflow.Context, input BillWorkflowInput) (BillResult, error) {
 	bill := initialBill(ctx, input)
 	seen := make(map[string]struct{}, len(bill.LineItems))
@@ -68,7 +79,11 @@ func BillingWorkflow(ctx workflow.Context, input BillWorkflowInput) (BillResult,
 		selector.Select(ctx)
 
 		if len(bill.LineItems) >= continueAsNewThreshold && !closed {
+			// Deep-copy LineItems so the new workflow run owns an independent
+			// backing array. A shallow struct copy aliases the slice, and any
+			// future append in the continued run could write into our snapshot.
 			snapshot := bill
+			snapshot.LineItems = append([]LineItem(nil), bill.LineItems...)
 			return BillResult{}, workflow.NewContinueAsNewError(ctx, BillingWorkflow, BillWorkflowInput{
 				BillID:   input.BillID,
 				Currency: input.Currency,

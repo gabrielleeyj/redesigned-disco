@@ -13,6 +13,7 @@ import (
 )
 
 const (
+	// TaskQueue is the Temporal task queue this service's worker polls.
 	TaskQueue           = "bill-task-queue"
 	defaultTemporalHost = "localhost:7233"
 	temporalHostEnvVar  = "TEMPORAL_HOSTPORT"
@@ -22,6 +23,9 @@ var db = sqldb.NewDatabase("bill", sqldb.DatabaseConfig{
 	Migrations: "./migrations",
 })
 
+// Service is the Encore service for bill operations. The Temporal client
+// and worker are owned for the service lifetime and torn down on Shutdown.
+//
 //encore:service
 type Service struct {
 	temporalClient client.Client
