@@ -1,8 +1,6 @@
 package bill
 
 import (
-	_ "embed"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -12,22 +10,19 @@ import (
 type Currency string
 
 type CurrencyMeta struct {
-	Code        string `json:"code"`
-	Name        string `json:"name"`
-	NumericCode int    `json:"numericCode"`
-	Decimals    int32  `json:"decimals"`
+	Code        string
+	Name        string
+	NumericCode int
+	Decimals    int32
 }
 
-//go:embed currencies.json
-var currenciesJSON []byte
-
-// currencies is the registry of supported currencies. The package-level
-// value is bootstrapped at init from currencies.json so non-DB callers
-// (tests, validation in HTTP handlers before initService completes) have
-// a sane default. At service startup, initService replaces it with the
-// authoritative set loaded from the currencies table — that is where
-// operators add or remove currencies at runtime.
-var currencies = mustLoadCurrencies(currenciesJSON)
+// currencies is the registry of supported currencies. It is populated by
+// initService from the currencies table at service startup and stays
+// empty in any context that does not boot the service (which would fail
+// other things first — sqldb.NewDatabase panics outside the Encore
+// runtime). Operators add or remove currencies via SQL against the
+// currencies table; a service restart picks up the change.
+var currencies = map[Currency]CurrencyMeta{}
 
 // Compatibility shims for the original API. New code should use the registry.
 const (
@@ -35,32 +30,8 @@ const (
 	CurrencyGEL Currency = "GEL"
 )
 
-func mustLoadCurrencies(data []byte) map[Currency]CurrencyMeta {
-	var entries []CurrencyMeta
-	if err := json.Unmarshal(data, &entries); err != nil {
-		panic(fmt.Sprintf("bill: parse currencies.json: %v", err))
-	}
-	if len(entries) == 0 {
-		panic("bill: currencies.json is empty")
-	}
-	out := make(map[Currency]CurrencyMeta, len(entries))
-	for i, e := range entries {
-		if e.Code == "" {
-			panic(fmt.Sprintf("bill: currencies.json entry %d missing code", i))
-		}
-		if e.Decimals < 0 || e.Decimals > 10 {
-			panic(fmt.Sprintf("bill: currencies.json entry %s has invalid decimals %d", e.Code, e.Decimals))
-		}
-		if _, dup := out[Currency(e.Code)]; dup {
-			panic(fmt.Sprintf("bill: duplicate currency %s in currencies.json", e.Code))
-		}
-		out[Currency(e.Code)] = e
-	}
-	return out
-}
-
-// setCurrencies replaces the registry. Intended for service init (DB load)
-// and tests that need to inject a controlled set.
+// setCurrencies replaces the registry. Called by initService after the DB
+// load completes.
 //
 //nolint:unused // called by initService, which is invoked by Encore
 func setCurrencies(m map[Currency]CurrencyMeta) {
