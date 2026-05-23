@@ -1,6 +1,8 @@
 package bill
 
 import (
+	_ "embed"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -10,30 +12,49 @@ import (
 type Currency string
 
 type CurrencyMeta struct {
-	Code     string
-	Decimals int32
-	Symbol   string
+	Code     string `json:"code"`
+	Decimals int32  `json:"decimals"`
+	Symbol   string `json:"symbol"`
 }
 
-// currencies is the registry of supported ISO-4217 currencies. Add entries
-// here to enable new currencies; everything else (validation, display,
-// rounding) reads from this table.
-var currencies = map[Currency]CurrencyMeta{
-	"USD": {Code: "USD", Decimals: 2, Symbol: "$"},
-	"EUR": {Code: "EUR", Decimals: 2, Symbol: "€"},
-	"GBP": {Code: "GBP", Decimals: 2, Symbol: "£"},
-	"GEL": {Code: "GEL", Decimals: 2, Symbol: "₾"},
-	"JPY": {Code: "JPY", Decimals: 0, Symbol: "¥"},
-	"KRW": {Code: "KRW", Decimals: 0, Symbol: "₩"},
-	"BHD": {Code: "BHD", Decimals: 3, Symbol: ".د.ب"},
-	"KWD": {Code: "KWD", Decimals: 3, Symbol: "د.ك"},
-}
+//go:embed currencies.json
+var currenciesJSON []byte
+
+// currencies is the registry of supported currencies, populated at init
+// from the embedded currencies.json file. Edit that file to add or remove
+// currencies; everything else (validation, display, rounding) reads from
+// this table.
+var currencies = mustLoadCurrencies(currenciesJSON)
 
 // Compatibility shims for the original API. New code should use the registry.
 const (
 	CurrencyUSD Currency = "USD"
 	CurrencyGEL Currency = "GEL"
 )
+
+func mustLoadCurrencies(data []byte) map[Currency]CurrencyMeta {
+	var entries []CurrencyMeta
+	if err := json.Unmarshal(data, &entries); err != nil {
+		panic(fmt.Sprintf("bill: parse currencies.json: %v", err))
+	}
+	if len(entries) == 0 {
+		panic("bill: currencies.json is empty")
+	}
+	out := make(map[Currency]CurrencyMeta, len(entries))
+	for i, e := range entries {
+		if e.Code == "" {
+			panic(fmt.Sprintf("bill: currencies.json entry %d missing code", i))
+		}
+		if e.Decimals < 0 || e.Decimals > 10 {
+			panic(fmt.Sprintf("bill: currencies.json entry %s has invalid decimals %d", e.Code, e.Decimals))
+		}
+		if _, dup := out[Currency(e.Code)]; dup {
+			panic(fmt.Sprintf("bill: duplicate currency %s in currencies.json", e.Code))
+		}
+		out[Currency(e.Code)] = e
+	}
+	return out
+}
 
 func (c Currency) Meta() (CurrencyMeta, bool) {
 	meta, ok := currencies[c]

@@ -1,0 +1,10 @@
+[
+  { "code": "USD", "decimals": 2, "symbol": "$" },
+  { "code": "EUR", "decimals": 2, "symbol": "€" },
+  { "code": "GBP", "decimals": 2, "symbol": "£" },
+  { "code": "GEL", "decimals": 2, "symbol": "₾" },
+  { "code": "JPY", "decimals": 0, "symbol": "¥" },
+  { "code": "KRW", "decimals": 0, "symbol": "₩" },
+  { "code": "BHD", "decimals": 3, "symbol": ".د.ب" },
+  { "code": "KWD", "decimals": 3, "symbol": "د.ك" }
+]
