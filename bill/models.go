@@ -33,12 +33,14 @@ type Money struct {
 }
 
 func (m Money) DisplayAmount() string {
-	whole := m.Amount / m.Currency.MinorUnitFactor()
-	frac := m.Amount % m.Currency.MinorUnitFactor()
-	if frac < 0 {
-		frac = -frac
+	factor := m.Currency.MinorUnitFactor()
+	abs := m.Amount
+	sign := ""
+	if abs < 0 {
+		sign = "-"
+		abs = -abs
 	}
-	return fmt.Sprintf("%d.%02d %s", whole, frac, m.Currency)
+	return fmt.Sprintf("%s%d.%02d %s", sign, abs/factor, abs%factor, m.Currency)
 }
 
 type LineItem struct {
