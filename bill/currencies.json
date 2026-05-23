@@ -1,10 +1,10 @@
 [
-  { "code": "USD", "decimals": 2, "symbol": "$" },
-  { "code": "EUR", "decimals": 2, "symbol": "€" },
-  { "code": "GBP", "decimals": 2, "symbol": "£" },
-  { "code": "GEL", "decimals": 2, "symbol": "₾" },
-  { "code": "JPY", "decimals": 0, "symbol": "¥" },
-  { "code": "KRW", "decimals": 0, "symbol": "₩" },
-  { "code": "BHD", "decimals": 3, "symbol": ".د.ب" },
-  { "code": "KWD", "decimals": 3, "symbol": "د.ك" }
+  { "code": "USD", "name": "US Dollar",      "numericCode": 840, "decimals": 2 },
+  { "code": "EUR", "name": "Euro",           "numericCode": 978, "decimals": 2 },
+  { "code": "GBP", "name": "Pound Sterling", "numericCode": 826, "decimals": 2 },
+  { "code": "GEL", "name": "Lari",           "numericCode": 981, "decimals": 2 },
+  { "code": "JPY", "name": "Yen",            "numericCode": 392, "decimals": 0 },
+  { "code": "KRW", "name": "Won",            "numericCode": 410, "decimals": 0 },
+  { "code": "BHD", "name": "Bahraini Dinar", "numericCode":  48, "decimals": 3 },
+  { "code": "KWD", "name": "Kuwaiti Dinar",  "numericCode": 414, "decimals": 3 }
 ]

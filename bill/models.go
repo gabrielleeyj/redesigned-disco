@@ -12,18 +12,21 @@ import (
 type Currency string
 
 type CurrencyMeta struct {
-	Code     string `json:"code"`
-	Decimals int32  `json:"decimals"`
-	Symbol   string `json:"symbol"`
+	Code        string `json:"code"`
+	Name        string `json:"name"`
+	NumericCode int    `json:"numericCode"`
+	Decimals    int32  `json:"decimals"`
 }
 
 //go:embed currencies.json
 var currenciesJSON []byte
 
-// currencies is the registry of supported currencies, populated at init
-// from the embedded currencies.json file. Edit that file to add or remove
-// currencies; everything else (validation, display, rounding) reads from
-// this table.
+// currencies is the registry of supported currencies. The package-level
+// value is bootstrapped at init from currencies.json so non-DB callers
+// (tests, validation in HTTP handlers before initService completes) have
+// a sane default. At service startup, initService replaces it with the
+// authoritative set loaded from the currencies table — that is where
+// operators add or remove currencies at runtime.
 var currencies = mustLoadCurrencies(currenciesJSON)
 
 // Compatibility shims for the original API. New code should use the registry.
@@ -54,6 +57,14 @@ func mustLoadCurrencies(data []byte) map[Currency]CurrencyMeta {
 		out[Currency(e.Code)] = e
 	}
 	return out
+}
+
+// setCurrencies replaces the registry. Intended for service init (DB load)
+// and tests that need to inject a controlled set.
+//
+//nolint:unused // called by initService, which is invoked by Encore
+func setCurrencies(m map[Currency]CurrencyMeta) {
+	currencies = m
 }
 
 func (c Currency) Meta() (CurrencyMeta, bool) {
