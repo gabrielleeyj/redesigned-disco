@@ -25,6 +25,10 @@ type Service struct {
 	temporalWorker worker.Worker
 }
 
+// initService is called by the Encore runtime when the service starts up.
+// The function is referenced by the //encore:service annotation above.
+//
+//nolint:unused // invoked by Encore framework via //encore:service
 func initService() (*Service, error) {
 	c, err := client.Dial(client.Options{
 		HostPort: temporalHostPort(),
@@ -55,6 +59,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+//nolint:unused // called by initService, which is invoked by Encore
 func temporalHostPort() string {
 	if h := os.Getenv(temporalHostEnvVar); h != "" {
 		return h
