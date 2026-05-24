@@ -3,6 +3,7 @@ package bill
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -217,6 +218,128 @@ func TestBillingWorkflow_SignalBeatsTimer(t *testing.T) {
 	var result BillResult
 	require.NoError(t, env.GetWorkflowResult(&result))
 	assert.Equal(t, CloseReasonSignal, result.CloseReason)
+}
+
+func TestBillingWorkflow_ContinueAsNewSnapshotPreservesSeenSet(t *testing.T) {
+	// Simulate a workflow resumed via ContinueAsNew with a snapshot +
+	// seen-set. A subsequent add of an item whose ID is already in
+	// the seen-set must be a no-op (dedup carried across the run
+	// boundary), AND must not invoke AppendLineItemActivity again.
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+
+	env.RegisterActivity(CreateBillActivity)
+	env.RegisterActivity(AppendLineItemActivity)
+	env.RegisterActivity(CloseBillActivity)
+	env.OnActivity(CreateBillActivity, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(CloseBillActivity, mock.Anything, mock.Anything).Return(nil)
+	// Track AppendLineItemActivity invocations so we can prove the
+	// duplicate item ID does NOT trigger a DB write on the
+	// continued run. Counter substitutes for the stub Return; the
+	// callback returns nil to keep the activity successful.
+	var appendCalls int
+	env.OnActivity(AppendLineItemActivity, mock.Anything, mock.Anything).Return(func(_ context.Context, _ AppendLineItemInput) error {
+		appendCalls++
+		return nil
+	})
+
+	now := time.Now()
+	snapshot := Bill{
+		ID:          "bill-cont",
+		AccountID:   wfTestAccountID,
+		Status:      BillStatusOpen,
+		Currency:    CurrencyUSD,
+		TotalAmount: dec("42.00"),
+		ItemCount:   3,
+		CreatedAt:   now.Add(-time.Hour),
+	}
+
+	// Replay the duplicate first, then a fresh item — confirms the
+	// seen-set survived AND new IDs still take the activity path.
+	env.RegisterDelayedCallback(func() {
+		env.UpdateWorkflow(UpdateAddLineItem, "", &testsuite.TestUpdateCallback{
+			OnAccept:   func() {},
+			OnReject:   func(err error) { t.Errorf("unexpected reject: %v", err) },
+			OnComplete: func(_ interface{}, err error) { assert.NoError(t, err) },
+		}, AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "carried-id", Description: "dup", Amount: dec("5.00"), Currency: CurrencyUSD})
+	}, time.Millisecond)
+	env.RegisterDelayedCallback(func() {
+		env.UpdateWorkflow(UpdateAddLineItem, "", &testsuite.TestUpdateCallback{
+			OnAccept:   func() {},
+			OnReject:   func(err error) { t.Errorf("unexpected reject: %v", err) },
+			OnComplete: func(_ interface{}, err error) { assert.NoError(t, err) },
+		}, AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "fresh-id", Description: "new", Amount: dec("7.00"), Currency: CurrencyUSD})
+	}, 2*time.Millisecond)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalCloseBill, CloseBillSignal{})
+	}, 3*time.Millisecond)
+
+	env.ExecuteWorkflow(BillingWorkflow, BillWorkflowInput{
+		BillID:      "bill-cont",
+		AccountID:   wfTestAccountID,
+		Currency:    CurrencyUSD,
+		Snapshot:    &snapshot,
+		SeenItemIDs: []string{"carried-id"},
+	})
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+
+	var result BillResult
+	require.NoError(t, env.GetWorkflowResult(&result))
+	assert.Equal(t, 1, appendCalls, "duplicate item must not invoke the append activity again")
+	assert.Equal(t, 4, result.ItemCount, "snapshot count (3) + one fresh item")
+	assert.True(t, dec("49.00").Equal(result.TotalAmount), "carried 42.00 + fresh 7.00")
+}
+
+func TestBillingWorkflow_CloseDrainsInFlightUpdates(t *testing.T) {
+	// Many updates arrive immediately before CloseBill. The workflow
+	// must drain them all (AllHandlersFinished) before finalising,
+	// otherwise the close activity records a total that is missing
+	// in-flight items. Verify the final total reflects every
+	// accepted update.
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+
+	registerAndStubActivities(env)
+
+	const n = 25
+	for i := 0; i < n; i++ {
+		i := i
+		env.RegisterDelayedCallback(func() {
+			env.UpdateWorkflow(UpdateAddLineItem, "", &testsuite.TestUpdateCallback{
+				OnAccept:   func() {},
+				OnReject:   func(err error) { t.Errorf("unexpected reject %d: %v", i, err) },
+				OnComplete: func(_ interface{}, err error) { assert.NoError(t, err) },
+			}, AddLineItemInput{
+				CallerAccountID: wfTestAccountID,
+				ItemID:          fmt.Sprintf("item-%d", i),
+				Description:     "fee",
+				Amount:          dec("1.00"),
+				Currency:        CurrencyUSD,
+			})
+		}, time.Millisecond)
+	}
+	// Close arrives at the same tick — workflow.Await on
+	// AllHandlersFinished must hold finalisation until every update
+	// handler completes.
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalCloseBill, CloseBillSignal{})
+	}, time.Millisecond)
+
+	env.ExecuteWorkflow(BillingWorkflow, BillWorkflowInput{
+		BillID:    "bill-drain",
+		AccountID: wfTestAccountID,
+		Currency:  CurrencyUSD,
+	})
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+
+	var result BillResult
+	require.NoError(t, env.GetWorkflowResult(&result))
+	assert.Equal(t, n, result.ItemCount, "drain must finish every update before close")
+	assert.True(t, dec("25.00").Equal(result.TotalAmount))
 }
 
 func TestBillingWorkflow_CloseActivityRetried(t *testing.T) {
