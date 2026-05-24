@@ -3,7 +3,10 @@ package bill
 import (
 	"context"
 	"testing"
+	"time"
 
+	"encore.dev/beta/errs"
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -171,21 +174,63 @@ func TestAddLineItem_ContextCanceled(t *testing.T) {
 	assert.Contains(t, err.Error(), "canceled")
 }
 
-func TestCloseBill_WorkflowNotFound(t *testing.T) {
+func TestCloseBill_WorkflowNotFound_NoDBRow(t *testing.T) {
+	// True 404: workflow is gone AND no persisted bill row exists.
+	// closeBillFromDB → sqldb.ErrNoRows → NotFound. Use a well-formed
+	// UUID so we exercise the no-rows path, not the column-type reject.
 	svc, mockClient := newTestService(t)
+	missingID := uuid.NewString()
 
 	mockClient.On("SignalWorkflow",
 		mock.Anything,
-		"bill-nonexistent",
+		"bill-"+missingID,
 		"",
 		SignalCloseBill,
 		mock.Anything,
 	).Return(&serviceerror.NotFound{Message: "workflow not found"})
 
-	_, err := svc.CloseBill(context.Background(), "nonexistent")
+	_, err := svc.CloseBill(context.Background(), missingID)
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not found or already closed")
+	var e *errs.Error
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.NotFound, e.Code)
+}
+
+func TestCloseBill_IdempotentRetryReturnsPersistedBill(t *testing.T) {
+	// Workflow already completed (e.g. previous successful close, or
+	// period-end timer fired). SignalWorkflow → NotFound, but the bill
+	// row is in the DB. Endpoint must return 200 with persisted state,
+	// not a 404.
+	svc, mockClient := newTestService(t)
+
+	billID := uuid.NewString()
+	closedAt := time.Now().UTC().Truncate(time.Microsecond)
+	createdAt := closedAt.Add(-time.Hour)
+
+	_, err := db.Exec(context.Background(), `
+		INSERT INTO bills (id, status, currency, total_amount, created_at, closed_at, close_reason)
+		VALUES ($1, 'CLOSED', 'USD', $2, $3, $4, 'SIGNAL')`,
+		billID, decimal.RequireFromString("42.50"), createdAt, closedAt,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DELETE FROM bills WHERE id = $1`, billID)
+	})
+
+	mockClient.On("SignalWorkflow",
+		mock.Anything,
+		"bill-"+billID,
+		"",
+		SignalCloseBill,
+		mock.Anything,
+	).Return(&serviceerror.NotFound{Message: "workflow not found"})
+
+	resp, err := svc.CloseBill(context.Background(), billID)
+	require.NoError(t, err)
+	assert.Equal(t, billID, resp.BillID)
+	assert.Equal(t, "CLOSED", resp.Status)
+	assert.True(t, decimal.RequireFromString("42.50").Equal(resp.TotalAmount))
 }
 
 func TestGetBill_FromWorkflow(t *testing.T) {

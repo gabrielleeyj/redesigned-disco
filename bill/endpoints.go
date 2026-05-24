@@ -8,6 +8,7 @@ import (
 
 	"encore.dev/beta/errs"
 	"encore.dev/rlog"
+	"encore.dev/storage/sqldb"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"go.temporal.io/api/serviceerror"
@@ -254,15 +255,26 @@ type CloseBillResponse struct {
 }
 
 //encore:api public method=POST path=/bills/:id/close
+//
+// CloseBill is idempotent. If the workflow has already completed (e.g.
+// the caller is retrying a successful close, or the period-end timer
+// already fired), the endpoint returns the persisted bill with the
+// same response shape as a first-time close. Only an unknown bill ID
+// produces a 404.
 func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse, error) {
 	workflowID := fmt.Sprintf("bill-%s", id)
 
-	if err := s.temporalClient.SignalWorkflow(ctx, workflowID, emptyRunID, SignalCloseBill, CloseBillSignal{}); err != nil {
+	err := s.temporalClient.SignalWorkflow(ctx, workflowID, emptyRunID, SignalCloseBill, CloseBillSignal{})
+	if err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return s.closeBillFromDB(ctx, id)
+		}
 		return nil, mapTemporalRPCError(err, "close bill")
 	}
 
-	var result BillResult
 	run := s.temporalClient.GetWorkflow(ctx, workflowID, emptyRunID)
+	var result BillResult
 	if err := run.Get(ctx, &result); err != nil {
 		rlog.Error("close bill workflow failed", "bill_id", id, "err", err)
 		return nil, &errs.Error{
@@ -271,8 +283,23 @@ func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse,
 		}
 	}
 
+	return s.closeBillFromDB(ctx, id)
+}
+
+// closeBillFromDB builds a CloseBillResponse from the persisted row.
+// Used both on the success path (after the workflow completed) and on
+// the idempotent-retry path (Temporal NotFound → workflow gone but
+// row already present). Maps no-rows to 404; other errors to 500.
+func (s *Service) closeBillFromDB(ctx context.Context, id string) (*CloseBillResponse, error) {
 	bill, err := s.getBillFromDB(ctx, id)
 	if err != nil {
+		if errors.Is(err, sqldb.ErrNoRows) {
+			return nil, &errs.Error{
+				Code:    errs.NotFound,
+				Message: fmt.Sprintf("bill %s not found", id),
+			}
+		}
+		rlog.Error("failed to load closed bill", "bill_id", id, "err", err)
 		return nil, &errs.Error{
 			Code:    errs.Internal,
 			Message: "failed to retrieve closed bill",
