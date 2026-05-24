@@ -37,17 +37,79 @@ flowchart LR
   Temporal --> WK
   WK -->|Activities| PG
   EP -->|Reads after close| PG
+
 ```
+
+## Architecture
+
+```mermaid
+flowchart TB
+  subgraph Client
+    C[HTTP Client]
+  end
+
+  subgraph Encore["Encore service (bill)"]
+    direction TB
+    EP[HTTP endpoints<br/>CreateBill / AddLineItem / CloseBill / GetBill / ListBills]
+    REG[(Currency registry<br/>LRU + TTL)]
+    WK[Temporal worker]
+    ACT[PersistBillActivity]
+    EP -.reads.-> REG
+    WK --> ACT
+  end
+
+  subgraph Temporal["Temporal cluster"]
+    SVR[Temporal server]
+    HIST[(Event history)]
+    SVR --- HIST
+  end
+
+  subgraph Postgres["Postgres (Encore-managed)"]
+    BIL[(bills)]
+    LI[(line_items)]
+    CUR[(currencies)]
+  end
+
+  C -- HTTPS --> EP
+  EP -- ExecuteWorkflow / UpdateWorkflow / SignalWorkflow / QueryWorkflow --> SVR
+  SVR -- task queue: bill-task-queue --> WK
+  ACT -- INSERT / UPDATE --> BIL
+  ACT -- INSERT --> LI
+  REG -- SELECT --> CUR
+  EP -- SELECT --> BIL
+  EP -- SELECT --> LI
+```
+
+Since we are building with **Encore** and **Temporal** as the focus,
+Encore owns the HTTP surface, deployment, db migration/connection (Postgres).
+Temporal owns the durability and concurrency aspect: we spawn one workflow per bill,
+sequentially updating and signalling within a single goroutine.
+Handling of race conditions and crash recovery on the in-flight bill state.
+Postgres records only confirmed closed bills and supported currencies that
+is configurable via the currency registry. Open bills live only in workflow state.
+
+## Bill Lifecycle (State)
+
+```mermaid
+stateDiagram-v2
+  [*] --> OPEN: CreateBill<br/>(starts workflow)
+  OPEN --> OPEN: AddLineItem<br/>(validated update)
+  OPEN --> OPEN: ContinueAsNew<br/>(at 1000 items)
+  OPEN --> CLOSED: CloseBill<br/>(signal → drain → persist)
+  CLOSED --> [*]
+```
+
+If the bill triggers `CloseBill` the bill will be immutable.
 
 ## API
 
-| Method | Path                       | Purpose                                    |
-| ------ | -------------------------- | ------------------------------------------ |
-| POST   | `/bills`                   | Create a bill (starts a workflow)          |
-| POST   | `/bills/:id/line-items`    | Add a line item (sync workflow update)     |
-| POST   | `/bills/:id/close`         | Close a bill (signal + drain + persist)    |
-| GET    | `/bills/:id`               | Get a bill (workflow query → DB fallback)  |
-| GET    | `/bills?limit=&offset=`    | List closed bills (DB, paginated)          |
+| Method | Path                    | Purpose                                   |
+| ------ | ----------------------- | ----------------------------------------- |
+| POST   | `/bills`                | Create a bill (starts a workflow)         |
+| POST   | `/bills/:id/line-items` | Add a line item (sync workflow update)    |
+| POST   | `/bills/:id/close`      | Close a bill (signal + drain + persist)   |
+| GET    | `/bills/:id`            | Get a bill (workflow query → DB fallback) |
+| GET    | `/bills?limit=&offset=` | List closed bills (DB, paginated)         |
 
 Amounts are JSON strings (full decimal precision). Currencies are
 ISO-4217 codes; whether a code is accepted is governed by the
@@ -79,8 +141,9 @@ curl -X POST http://localhost:4000/bills/<billId>/line-items \
 The update is synchronous: by the time the response returns, the
 workflow has applied the item and the totals reflect it. A currency
 mismatch, non-positive amount, or empty description is rejected by the
-workflow's validator and returns `InvalidArgument` *without* mutating
+workflow's validator and returns `InvalidArgument` _without_ mutating
 state.
+**Note**: `idempotencyKey (optional)`
 
 ### Close a bill
 
