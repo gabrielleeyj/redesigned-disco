@@ -578,6 +578,80 @@ func TestListLineItems_RejectsMalformedCursor(t *testing.T) {
 	assert.Equal(t, errs.InvalidArgument, e.Code)
 }
 
+func TestListBills_FilterByStatusAndKeysetPagination(t *testing.T) {
+	// Insert 3 OPEN + 2 CLOSED bills under testAccountID and 1 bill
+	// under another account (to confirm tenancy scoping). Verify:
+	//  - default returns all 5 of the caller's bills DESC by created_at
+	//  - status=OPEN returns the 3 OPEN bills
+	//  - keyset pagination walks the whole set with no duplicates/gaps
+	//  - other-account bill never appears
+	withTestAuth(t)
+	svc, _ := newTestService(t)
+
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	ids := make([]string, 5)
+	statuses := []BillStatus{BillStatusOpen, BillStatusClosed, BillStatusOpen, BillStatusClosed, BillStatusOpen}
+	for i := range ids {
+		ids[i] = uuid.NewString()
+		_, err := db.Exec(context.Background(), `
+			INSERT INTO bills (id, account_id, status, currency, total_amount, created_at)
+			VALUES ($1, $2, $3, 'USD', 0, $4)`,
+			ids[i], testAccountID, string(statuses[i]), base.Add(time.Duration(i)*time.Second),
+		)
+		require.NoError(t, err)
+	}
+	otherID := uuid.NewString()
+	_, err := db.Exec(context.Background(), `
+		INSERT INTO bills (id, account_id, status, currency, total_amount, created_at)
+		VALUES ($1, 'other-account', 'OPEN', 'USD', 0, $2)`,
+		otherID, base,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DELETE FROM bills WHERE account_id IN ($1, 'other-account')`, testAccountID)
+	})
+
+	// All five, paginated with limit=2.
+	collected := []string{}
+	cursor := ""
+	for {
+		resp, err := svc.ListBills(context.Background(), &ListBillsRequest{Cursor: cursor, Limit: 2})
+		require.NoError(t, err)
+		for _, b := range resp.Bills {
+			collected = append(collected, b.ID)
+			assert.NotEqual(t, otherID, b.ID, "other-account bill must never appear")
+		}
+		if resp.NextCursor == "" {
+			break
+		}
+		cursor = resp.NextCursor
+	}
+	// Order is created_at DESC, so the newest (index 4) first.
+	expected := []string{ids[4], ids[3], ids[2], ids[1], ids[0]}
+	assert.Equal(t, expected, collected)
+
+	// Status filter — only OPEN.
+	openResp, err := svc.ListBills(context.Background(), &ListBillsRequest{Status: "OPEN", Limit: 100})
+	require.NoError(t, err)
+	openIDs := make([]string, 0, len(openResp.Bills))
+	for _, b := range openResp.Bills {
+		assert.Equal(t, BillStatusOpen, b.Status)
+		openIDs = append(openIDs, b.ID)
+	}
+	assert.ElementsMatch(t, []string{ids[0], ids[2], ids[4]}, openIDs)
+}
+
+func TestListBills_RejectsInvalidStatus(t *testing.T) {
+	withTestAuth(t)
+	svc, _ := newTestService(t)
+
+	_, err := svc.ListBills(context.Background(), &ListBillsRequest{Status: "PENDING"})
+	require.Error(t, err)
+	var e *errs.Error
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.InvalidArgument, e.Code)
+}
+
 func TestAuthHandler_RejectsMissingHeader(t *testing.T) {
 	_, _, err := AuthHandler(context.Background(), &AuthParams{AccountID: ""})
 	require.Error(t, err)

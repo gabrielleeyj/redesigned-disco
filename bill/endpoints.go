@@ -644,28 +644,11 @@ func (s *Service) ListLineItems(ctx context.Context, id string, req *ListLineIte
 	}, nil
 }
 
-// decodeLineItemCursor splits a base64-encoded `<rfc3339>|<uuid>`
-// cursor into its components. Empty cursor returns zero values which
-// the WHERE predicate treats as "start from the beginning". A
-// malformed cursor is an InvalidArgument — callers should not be
-// crafting cursors by hand.
 func decodeLineItemCursor(req *ListLineItemsRequest) (time.Time, string, error) {
 	if req == nil || req.Cursor == "" {
 		return time.Time{}, "", nil
 	}
-	raw, err := base64.URLEncoding.DecodeString(req.Cursor)
-	if err != nil {
-		return time.Time{}, "", &errs.Error{Code: errs.InvalidArgument, Message: "invalid cursor"}
-	}
-	parts := strings.SplitN(string(raw), "|", 2)
-	if len(parts) != 2 {
-		return time.Time{}, "", &errs.Error{Code: errs.InvalidArgument, Message: "invalid cursor"}
-	}
-	ts, err := time.Parse(time.RFC3339Nano, parts[0])
-	if err != nil {
-		return time.Time{}, "", &errs.Error{Code: errs.InvalidArgument, Message: "invalid cursor"}
-	}
-	return ts, parts[1], nil
+	return decodeKeysetCursor(req.Cursor)
 }
 
 func encodeLineItemCursor(ts time.Time, id string) string {
@@ -673,34 +656,56 @@ func encodeLineItemCursor(ts time.Time, id string) string {
 }
 
 type ListBillsRequest struct {
-	Limit  int `query:"limit"`
-	Offset int `query:"offset"`
+	// Status filters by lifecycle state. Empty returns OPEN+CLOSED.
+	// Valid values: OPEN, CLOSED.
+	Status string `query:"status"`
+	// Cursor is opaque — pass back NextCursor from the previous
+	// response. Format is implementation-defined.
+	Cursor string `query:"cursor"`
+	Limit  int    `query:"limit"`
 }
 
 type ListBillsResponse struct {
-	Bills  []Bill `json:"bills"`
-	Limit  int    `json:"limit"`
-	Offset int    `json:"offset"`
+	Bills      []Bill `json:"bills"`
+	NextCursor string `json:"nextCursor,omitempty"`
+	Limit      int    `json:"limit"`
 }
 
 //encore:api auth method=GET path=/bills
+//
+// ListBills returns bills owned by the caller in descending created-at
+// order. Use the optional status filter and the NextCursor in the
+// response for keyset pagination — OFFSET-based pagination is not
+// supported because it scans linearly as the table grows.
 func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBillsResponse, error) {
-	if req != nil && (req.Limit < 0 || req.Offset < 0) {
+	if req != nil && req.Limit < 0 {
 		return nil, &errs.Error{
 			Code:    errs.InvalidArgument,
-			Message: "limit and offset must be non-negative",
+			Message: "limit must be non-negative",
 		}
 	}
-	limit, offset := normalizeListPagination(req)
 
-	rows, err := db.Query(ctx, `
-		SELECT id, account_id, status, currency, total_amount, created_at, closed_at,
-		       period_start, period_end, close_reason
-		FROM bills
-		WHERE account_id = $1
-		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3`, callerAccountID(ctx), limit, offset)
+	limit := defaultListLimit
+	if req != nil && req.Limit > 0 {
+		limit = req.Limit
+	}
+	if limit > maxListLimit {
+		limit = maxListLimit
+	}
+
+	statusFilter, err := normalizeListStatus(req)
 	if err != nil {
+		return nil, err
+	}
+
+	cursorTime, cursorID, err := decodeBillCursor(req)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := queryBillsPage(ctx, callerAccountID(ctx), statusFilter, cursorTime, cursorID, limit+1)
+	if err != nil {
+		rlog.Error("list bills query failed", "err", err)
 		return nil, &errs.Error{
 			Code:    errs.Internal,
 			Message: "failed to list bills",
@@ -717,7 +722,6 @@ func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBi
 				Message: "failed to scan bill",
 			}
 		}
-		b.LineItems = []LineItem{}
 		bills = append(bills, b)
 	}
 	if err := rows.Err(); err != nil {
@@ -727,23 +731,96 @@ func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBi
 		}
 	}
 
-	return &ListBillsResponse{Bills: bills, Limit: limit, Offset: offset}, nil
+	var nextCursor string
+	if len(bills) > limit {
+		last := bills[limit-1]
+		nextCursor = encodeBillCursor(last.CreatedAt, last.ID)
+		bills = bills[:limit]
+	}
+
+	return &ListBillsResponse{Bills: bills, NextCursor: nextCursor, Limit: limit}, nil
 }
 
-func normalizeListPagination(req *ListBillsRequest) (limit, offset int) {
-	limit = defaultListLimit
-	if req != nil {
-		if req.Limit > 0 {
-			limit = req.Limit
-		}
-		if req.Offset > 0 {
-			offset = req.Offset
-		}
+// normalizeListStatus accepts OPEN, CLOSED, or empty. Empty returns
+// the wildcard sentinel ("") consumed by queryBillsPage. Anything
+// else is an InvalidArgument.
+func normalizeListStatus(req *ListBillsRequest) (string, error) {
+	if req == nil || req.Status == "" {
+		return "", nil
 	}
-	if limit > maxListLimit {
-		limit = maxListLimit
+	switch BillStatus(req.Status) {
+	case BillStatusOpen, BillStatusClosed:
+		return req.Status, nil
 	}
-	return limit, offset
+	return "", &errs.Error{
+		Code:    errs.InvalidArgument,
+		Message: fmt.Sprintf("status must be OPEN or CLOSED (got %q)", req.Status),
+	}
+}
+
+// queryBillsPage assembles the keyset-paginated query. Branches on
+// cursor presence (empty UUID can't be cast for tuple comparison) and
+// status presence. Sort is (created_at DESC, id DESC) so the
+// `(created_at, id) < (cursor)` predicate slices the next page.
+func queryBillsPage(ctx context.Context, accountID, status string, cursorTime time.Time, cursorID string, limit int) (*sqldb.Rows, error) {
+	const cols = `id, account_id, status, currency, total_amount, created_at, closed_at,
+	              period_start, period_end, close_reason`
+	switch {
+	case cursorID == "" && status == "":
+		return db.Query(ctx, `
+			SELECT `+cols+` FROM bills
+			WHERE account_id = $1
+			ORDER BY created_at DESC, id DESC
+			LIMIT $2`, accountID, limit)
+	case cursorID == "" && status != "":
+		return db.Query(ctx, `
+			SELECT `+cols+` FROM bills
+			WHERE account_id = $1 AND status = $2
+			ORDER BY created_at DESC, id DESC
+			LIMIT $3`, accountID, status, limit)
+	case cursorID != "" && status == "":
+		return db.Query(ctx, `
+			SELECT `+cols+` FROM bills
+			WHERE account_id = $1 AND (created_at, id) < ($2, $3)
+			ORDER BY created_at DESC, id DESC
+			LIMIT $4`, accountID, cursorTime, cursorID, limit)
+	default:
+		return db.Query(ctx, `
+			SELECT `+cols+` FROM bills
+			WHERE account_id = $1 AND status = $2 AND (created_at, id) < ($3, $4)
+			ORDER BY created_at DESC, id DESC
+			LIMIT $5`, accountID, status, cursorTime, cursorID, limit)
+	}
+}
+
+func decodeBillCursor(req *ListBillsRequest) (time.Time, string, error) {
+	if req == nil || req.Cursor == "" {
+		return time.Time{}, "", nil
+	}
+	return decodeKeysetCursor(req.Cursor)
+}
+
+func encodeBillCursor(ts time.Time, id string) string {
+	return base64.URLEncoding.EncodeToString([]byte(ts.Format(time.RFC3339Nano) + "|" + id))
+}
+
+// decodeKeysetCursor is shared between bill and line-item cursors —
+// both use the same `<rfc3339nano>|<id>` shape. Kept private to this
+// package; the cursor format is not part of the public contract.
+func decodeKeysetCursor(cursor string) (time.Time, string, error) {
+	raw, err := base64.URLEncoding.DecodeString(cursor)
+	if err != nil {
+		return time.Time{}, "", &errs.Error{Code: errs.InvalidArgument, Message: "invalid cursor"}
+	}
+	parts := strings.SplitN(string(raw), "|", 2)
+	if len(parts) != 2 {
+		return time.Time{}, "", &errs.Error{Code: errs.InvalidArgument, Message: "invalid cursor"}
+	}
+	ts, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return time.Time{}, "", &errs.Error{Code: errs.InvalidArgument, Message: "invalid cursor"}
+	}
+	return ts, parts[1], nil
 }
 
 // rowScanner abstracts over *sqldb.Row and *sqldb.Rows so a single Bill
