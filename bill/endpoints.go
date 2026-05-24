@@ -251,7 +251,8 @@ type CloseBillResponse struct {
 	TotalAmount decimal.Decimal `json:"totalAmount"`
 	Currency    string          `json:"currency"`
 	LineItems   []LineItem      `json:"lineItems"`
-	ClosedAt    string          `json:"closedAt"`
+	ClosedAt    *time.Time      `json:"closedAt,omitempty"`
+	CloseReason CloseReason     `json:"closeReason,omitempty"`
 }
 
 //encore:api public method=POST path=/bills/:id/close
@@ -306,18 +307,14 @@ func (s *Service) closeBillFromDB(ctx context.Context, id string) (*CloseBillRes
 		}
 	}
 
-	closedAt := ""
-	if bill.ClosedAt != nil {
-		closedAt = bill.ClosedAt.Format("2006-01-02T15:04:05Z07:00")
-	}
-
 	return &CloseBillResponse{
 		BillID:      bill.ID,
 		Status:      string(bill.Status),
 		TotalAmount: bill.TotalAmount,
 		Currency:    string(bill.Currency),
 		LineItems:   bill.LineItems,
-		ClosedAt:    closedAt,
+		ClosedAt:    bill.ClosedAt,
+		CloseReason: bill.CloseReason,
 	}, nil
 }
 
