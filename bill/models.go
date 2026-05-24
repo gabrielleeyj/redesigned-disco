@@ -98,25 +98,12 @@ type BillEvent struct {
 	CreatedAt time.Time       `json:"createdAt"`
 }
 
-// Money carries an arbitrary-precision decimal amount tagged with a currency.
-// Persistence and arithmetic preserve full precision; rounding is applied at
-// display boundaries only.
-type Money struct {
-	Amount   decimal.Decimal `json:"amount"`
-	Currency Currency        `json:"currency"`
-}
-
-// NewMoney constructs a Money value.
-func NewMoney(amount decimal.Decimal, currency Currency) Money {
-	return Money{Amount: amount, Currency: currency}
-}
-
-// DisplayAmount renders the value rounded to the currency's standard
-// fractional digits. Use this for human-facing output only; never for
+// FormatAmount renders an amount rounded to the currency's standard
+// fractional digits, suffixed with the code (e.g. "10.00 USD",
+// "1235 JPY"). Use this for human-facing output only; never for
 // further computation.
-func (m Money) DisplayAmount() string {
-	decimals := m.Currency.Decimals()
-	return fmt.Sprintf("%s %s", m.Amount.StringFixed(decimals), m.Currency)
+func (c Currency) FormatAmount(amount decimal.Decimal) string {
+	return fmt.Sprintf("%s %s", amount.StringFixed(c.Decimals()), c)
 }
 
 // LineItem is a single charge on a Bill. Amount is in the bill's currency

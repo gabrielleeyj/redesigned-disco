@@ -783,24 +783,25 @@ func TestAuthHandler_AcceptsNonEmptyHeader(t *testing.T) {
 	assert.Equal(t, "acct-42", data.AccountID)
 }
 
-func TestMoney_DisplayAmount(t *testing.T) {
+func TestCurrency_FormatAmount(t *testing.T) {
 	tests := []struct {
-		name string
-		m    Money
-		want string
+		name     string
+		currency Currency
+		amount   decimal.Decimal
+		want     string
 	}{
-		{name: "USD whole", m: Money{Amount: decimal.NewFromInt(10), Currency: "USD"}, want: "10.00 USD"},
-		{name: "USD cents", m: Money{Amount: decimal.RequireFromString("10.50"), Currency: "USD"}, want: "10.50 USD"},
-		{name: "GEL", m: Money{Amount: decimal.RequireFromString("25.75"), Currency: "GEL"}, want: "25.75 GEL"},
-		{name: "zero USD", m: Money{Amount: decimal.Zero, Currency: "USD"}, want: "0.00 USD"},
-		{name: "JPY rounds to whole", m: Money{Amount: decimal.RequireFromString("1234.56"), Currency: "JPY"}, want: "1235 JPY"},
-		{name: "BHD three decimals", m: Money{Amount: decimal.RequireFromString("12.345"), Currency: "BHD"}, want: "12.345 BHD"},
-		{name: "negative below unit", m: Money{Amount: decimal.RequireFromString("-0.50"), Currency: "USD"}, want: "-0.50 USD"},
+		{name: "USD whole", currency: "USD", amount: decimal.NewFromInt(10), want: "10.00 USD"},
+		{name: "USD cents", currency: "USD", amount: decimal.RequireFromString("10.50"), want: "10.50 USD"},
+		{name: "GEL", currency: "GEL", amount: decimal.RequireFromString("25.75"), want: "25.75 GEL"},
+		{name: "zero USD", currency: "USD", amount: decimal.Zero, want: "0.00 USD"},
+		{name: "JPY rounds to whole", currency: "JPY", amount: decimal.RequireFromString("1234.56"), want: "1235 JPY"},
+		{name: "BHD three decimals", currency: "BHD", amount: decimal.RequireFromString("12.345"), want: "12.345 BHD"},
+		{name: "negative below unit", currency: "USD", amount: decimal.RequireFromString("-0.50"), want: "-0.50 USD"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, tt.m.DisplayAmount())
+			assert.Equal(t, tt.want, tt.currency.FormatAmount(tt.amount))
 		})
 	}
 }
