@@ -24,10 +24,21 @@ const testAccountID = "acct-test"
 
 // withTestAuth sets the per-test auth identity so endpoint methods
 // that call callerAccountID see a non-empty account. Without this,
-// auth.Data() returns nil and ownership checks fail.
+// auth.Data() returns nil and ownership checks fail. Status defaults
+// to ACTIVE; tests that want SUSPENDED semantics call
+// withTestAuthStatus instead.
 func withTestAuth(t *testing.T) {
 	t.Helper()
-	et.OverrideAuthInfo(auth.UID(testAccountID), &AuthData{AccountID: testAccountID})
+	withTestAuthStatus(t, ClientStatusActive)
+}
+
+func withTestAuthStatus(t *testing.T, status ClientStatus) {
+	t.Helper()
+	et.OverrideAuthInfo(auth.UID(testAccountID), &AuthData{
+		AccountID: testAccountID,
+		Status:    status,
+		Name:      "Test Account",
+	})
 }
 
 type mockQueryResult struct {
@@ -767,6 +778,63 @@ func TestRefreshCurrencies_RebuildsCacheFromDB(t *testing.T) {
 	assert.True(t, Currency("USD").Valid(), "registry should know USD again after refresh")
 }
 
+func TestSuspendedAccount_WriteBlockedReadAllowed(t *testing.T) {
+	// SUSPENDED clients: every mutating endpoint must return
+	// PermissionDenied; reads continue to work so the account can
+	// inspect its own balance during dispute resolution.
+	withTestAuthStatus(t, ClientStatusSuspended)
+	svc, mockClient := newTestService(t)
+
+	// Writes: CreateBill, AddLineItem, CloseBill, RefreshCurrencies
+	// all reject before any Temporal call.
+	_, err := svc.CreateBill(context.Background(), &CreateBillRequest{Currency: "USD"})
+	require.Error(t, err)
+	var e *errs.Error
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.PermissionDenied, e.Code)
+
+	_, err = svc.AddLineItem(context.Background(), "bill-x", &AddLineItemRequest{
+		Description: "fee", Amount: decimal.NewFromInt(1), Currency: "USD",
+	})
+	require.Error(t, err)
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.PermissionDenied, e.Code)
+
+	_, err = svc.CloseBill(context.Background(), "bill-x")
+	require.Error(t, err)
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.PermissionDenied, e.Code)
+
+	_, err = svc.RefreshCurrencies(context.Background())
+	require.Error(t, err)
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.PermissionDenied, e.Code)
+
+	// Reads still work. Seed a bill owned by the suspended account
+	// and confirm GetBill returns it.
+	billID := uuid.NewString()
+	_, err = db.Exec(context.Background(), `
+		INSERT INTO bills (id, account_id, status, currency, total_amount, created_at)
+		VALUES ($1, $2, 'OPEN', 'USD', 0, NOW())`,
+		billID, testAccountID,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DELETE FROM bills WHERE id = $1`, billID)
+	})
+
+	mockClient.On("QueryWorkflow",
+		mock.Anything,
+		"bill-"+billID,
+		"",
+		QueryBillState,
+	).Return((*mockQueryResult)(nil), &serviceerror.NotFound{Message: "completed"})
+
+	resp, err := svc.GetBill(context.Background(), billID)
+	require.NoError(t, err, "suspended account must still be able to read its own bills")
+	assert.Equal(t, billID, resp.Bill.ID)
+}
+
 func TestAuthHandler_RejectsMissingHeader(t *testing.T) {
 	_, _, err := AuthHandler(context.Background(), &AuthParams{AccountID: ""})
 	require.Error(t, err)
@@ -775,12 +843,25 @@ func TestAuthHandler_RejectsMissingHeader(t *testing.T) {
 	assert.Equal(t, errs.Unauthenticated, e.Code)
 }
 
-func TestAuthHandler_AcceptsNonEmptyHeader(t *testing.T) {
-	uid, data, err := AuthHandler(context.Background(), &AuthParams{AccountID: "acct-42"})
+func TestAuthHandler_AcceptsKnownClient(t *testing.T) {
+	uid, data, err := AuthHandler(context.Background(), &AuthParams{AccountID: testAccountID})
 	require.NoError(t, err)
-	assert.Equal(t, auth.UID("acct-42"), uid)
+	assert.Equal(t, auth.UID(testAccountID), uid)
 	require.NotNil(t, data)
-	assert.Equal(t, "acct-42", data.AccountID)
+	assert.Equal(t, testAccountID, data.AccountID)
+	assert.Equal(t, ClientStatusActive, data.Status)
+}
+
+func TestAuthHandler_RejectsUnknownClient(t *testing.T) {
+	// Unknown account must map to Unauthenticated, not NotFound —
+	// otherwise an attacker can enumerate valid account IDs by
+	// watching response codes.
+	invalidateClient("never-seen-account")
+	_, _, err := AuthHandler(context.Background(), &AuthParams{AccountID: "never-seen-account"})
+	require.Error(t, err)
+	var e *errs.Error
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.Unauthenticated, e.Code)
 }
 
 func TestCurrency_FormatAmount(t *testing.T) {

@@ -124,12 +124,30 @@ ISO-4217 codes; whether a code is accepted is governed by the
 ### Authentication (stub)
 
 Every request must include an `X-Account-Id: <opaque-id>` header. The
-caller's account scopes both ownership (you can only see/mutate your
-own bills) and the audit-log actor field.
+asserted ID is validated against the local `clients` table; unknown
+IDs return `401 Unauthenticated` (deliberately indistinguishable from
+a missing header so callers can't enumerate valid IDs). The caller's
+account scopes both ownership (you can only see/mutate your own
+bills) and the audit-log actor field.
 
-**This is a take-home stub.** In production, replace with JWT / mTLS /
-SSO — see the `TODO production` comment in `bill/auth.go`. Trusting a
-client-supplied header in production is unsafe.
+**Seed clients (loaded by migration):**
+
+| ID                | Status    | Notes                              |
+| ----------------- | --------- | ---------------------------------- |
+| `acct-alpha`      | ACTIVE    | Default demo account               |
+| `acct-beta`       | ACTIVE    | Second demo account, for tenancy   |
+| `acct-suspended`  | SUSPENDED | Reads OK, every write returns 403  |
+
+`SUSPENDED` accounts can still read their own bills (so a frozen
+account can inspect its balance during dispute resolution) but every
+mutating endpoint returns `403 PermissionDenied`.
+
+**This is a two-layer stub.** In production, replace the header with
+real auth (JWT / mTLS / SSO) AND replace the local `clients` table
+with a call to an external account / identity service. The bills
+service should not own client data — it should treat account IDs as
+opaque strings supplied by a trusted identity service. See the
+`TODO production` comments in `bill/auth.go` and `bill/clients.go`.
 
 ### Create a bill
 

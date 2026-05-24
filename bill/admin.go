@@ -26,6 +26,9 @@ type RefreshCurrenciesResponse struct {
 // production posture. Wire role-based access control when the auth
 // handler is replaced (see auth.go TODO).
 func (s *Service) RefreshCurrencies(ctx context.Context) (*RefreshCurrenciesResponse, error) {
+	if err := assertActiveCaller(ctx); err != nil {
+		return nil, err
+	}
 	count, err := refreshCurrencies(ctx)
 	if err != nil {
 		rlog.Error("currency registry refresh failed", "err", err)

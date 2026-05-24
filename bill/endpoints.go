@@ -67,6 +67,9 @@ type CreateBillResponse struct {
 
 //encore:api auth method=POST path=/bills
 func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*CreateBillResponse, error) {
+	if err := assertActiveCaller(ctx); err != nil {
+		return nil, err
+	}
 	currency := Currency(req.Currency)
 	if !currency.Valid() {
 		return nil, &errs.Error{
@@ -193,6 +196,9 @@ type AddLineItemResponse struct {
 
 //encore:api auth method=POST path=/bills/:id/line-items
 func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRequest) (*AddLineItemResponse, error) {
+	if err := assertActiveCaller(ctx); err != nil {
+		return nil, err
+	}
 	if req.Description == "" {
 		return nil, &errs.Error{
 			Code:    errs.InvalidArgument,
@@ -362,6 +368,9 @@ type CloseBillResponse struct {
 // same response shape as a first-time close. Only an unknown bill ID
 // produces a 404.
 func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse, error) {
+	if err := assertActiveCaller(ctx); err != nil {
+		return nil, err
+	}
 	if err := s.assertOwnsBill(ctx, id); err != nil {
 		return nil, err
 	}

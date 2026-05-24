@@ -1,6 +1,7 @@
 package bill
 
 import (
+	"context"
 	"os"
 	"testing"
 )
@@ -18,12 +19,43 @@ var testRegistry = map[Currency]CurrencyMeta{
 	"KWD": {Code: "KWD", Name: "Kuwaiti Dinar", NumericCode: 414, Decimals: 3},
 }
 
-// TestMain primes the currency cache before any test runs so tests that
-// touch Currency.Valid / .Decimals / .Meta (or the AddLineItem endpoint
-// validation, which calls them) are hermetic and do not depend on the
-// real DB. encore test also runs initService, which would overwrite this
-// — that is fine, the DB seed and the test registry agree.
+// testAccountIDs are seeded into the clients table by TestMain so the
+// bills.account_id FK is satisfied when tests INSERT bills directly
+// with these IDs. Tests that need a different account (e.g. the
+// "other-account" leak-check) add it here too.
+var testAccountIDs = []struct {
+	id, name string
+	status   ClientStatus
+}{
+	{id: "acct-test", name: "Test Account", status: ClientStatusActive},
+	{id: "acct-wf-test", name: "Workflow Test Account", status: ClientStatusActive},
+	{id: "other-account", name: "Other Account", status: ClientStatusActive},
+}
+
+// TestMain primes the currency cache and seeds test clients before
+// any test runs so tests that touch Currency.Valid / .Decimals /
+// .Meta (or the AddLineItem endpoint validation, which calls them)
+// are hermetic and do not depend on the real DB seed alone. encore
+// test also runs initService, which would overwrite the currency
+// cache — that is fine, the DB seed and the test registry agree.
+//
+// Client seeding uses INSERT ... ON CONFLICT so repeated test runs
+// against the same DB are idempotent.
 func TestMain(m *testing.M) {
 	setCurrencies(testRegistry)
+	seedTestClients()
 	os.Exit(m.Run())
+}
+
+func seedTestClients() {
+	ctx := context.Background()
+	for _, c := range testAccountIDs {
+		_, err := db.Exec(ctx, `
+			INSERT INTO clients (id, name, status) VALUES ($1, $2, $3)
+			ON CONFLICT (id) DO NOTHING`,
+			c.id, c.name, string(c.status))
+		if err != nil {
+			panic("seed test client " + c.id + ": " + err.Error())
+		}
+	}
 }
