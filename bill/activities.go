@@ -37,14 +37,14 @@ func PersistBillActivity(ctx context.Context, bill Bill) error {
 	}()
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO bills (id, status, currency, total_amount, created_at, closed_at, period_start, period_end, close_reason)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO bills (id, account_id, status, currency, total_amount, created_at, closed_at, period_start, period_end, close_reason)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (id) DO UPDATE SET
 			status = EXCLUDED.status,
 			total_amount = EXCLUDED.total_amount,
 			closed_at = EXCLUDED.closed_at,
 			close_reason = EXCLUDED.close_reason`,
-		bill.ID, string(bill.Status), string(bill.Currency), bill.TotalAmount,
+		bill.ID, bill.AccountID, string(bill.Status), string(bill.Currency), bill.TotalAmount,
 		bill.CreatedAt, bill.ClosedAt, bill.PeriodStart, bill.PeriodEnd,
 		nullableCloseReason(bill.CloseReason),
 	)

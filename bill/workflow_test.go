@@ -21,6 +21,12 @@ type addStep struct {
 
 func dec(s string) decimal.Decimal { return decimal.RequireFromString(s) }
 
+// wfTestAccountID is the account id stamped on every test bill /
+// AddLineItemInput. The workflow validator now checks ownership via
+// CallerAccountID == bill.AccountID, so these must agree for valid
+// updates to pass.
+const wfTestAccountID = "acct-wf-test"
+
 func TestBillingWorkflow(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -31,58 +37,68 @@ func TestBillingWorkflow(t *testing.T) {
 	}{
 		{
 			name:      "create and close empty bill",
-			input:     BillWorkflowInput{BillID: "bill-1", Currency: CurrencyUSD},
+			input:     BillWorkflowInput{AccountID: wfTestAccountID, BillID: "bill-1", Currency: CurrencyUSD},
 			adds:      nil,
 			wantTotal: decimal.Zero,
 			wantItems: 0,
 		},
 		{
 			name:  "add three items then close",
-			input: BillWorkflowInput{BillID: "bill-2", Currency: CurrencyUSD},
+			input: BillWorkflowInput{AccountID: wfTestAccountID, BillID: "bill-2", Currency: CurrencyUSD},
 			adds: []addStep{
-				{in: AddLineItemInput{ItemID: "i1", Description: "Fee A", Amount: dec("10.00"), Currency: CurrencyUSD}},
-				{in: AddLineItemInput{ItemID: "i2", Description: "Fee B", Amount: dec("25.00"), Currency: CurrencyUSD}},
-				{in: AddLineItemInput{ItemID: "i3", Description: "Fee C", Amount: dec("5.00"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "i1", Description: "Fee A", Amount: dec("10.00"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "i2", Description: "Fee B", Amount: dec("25.00"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "i3", Description: "Fee C", Amount: dec("5.00"), Currency: CurrencyUSD}},
 			},
 			wantTotal: dec("40.00"),
 			wantItems: 3,
 		},
 		{
 			name:  "sub-cent precision preserved across additions",
-			input: BillWorkflowInput{BillID: "bill-precise", Currency: "USD"},
+			input: BillWorkflowInput{AccountID: wfTestAccountID, BillID: "bill-precise", Currency: "USD"},
 			adds: []addStep{
-				{in: AddLineItemInput{ItemID: "p1", Description: "Micro fee", Amount: dec("0.0001"), Currency: CurrencyUSD}},
-				{in: AddLineItemInput{ItemID: "p2", Description: "Interest", Amount: dec("0.123456789"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "p1", Description: "Micro fee", Amount: dec("0.0001"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "p2", Description: "Interest", Amount: dec("0.123456789"), Currency: CurrencyUSD}},
 			},
 			wantTotal: dec("0.123556789"),
 			wantItems: 2,
 		},
 		{
-			name:  "wrong currency item rejected by validator",
-			input: BillWorkflowInput{BillID: "bill-3", Currency: CurrencyUSD},
+			name:  "wrong account rejected by validator (ownership)",
+			input: BillWorkflowInput{AccountID: wfTestAccountID, BillID: "bill-tenant", Currency: CurrencyUSD},
 			adds: []addStep{
-				{in: AddLineItemInput{ItemID: "i1", Description: "Valid", Amount: dec("10.00"), Currency: CurrencyUSD}},
-				{in: AddLineItemInput{ItemID: "i2", Description: "Invalid GEL", Amount: dec("5.00"), Currency: CurrencyGEL}, wantRejected: true},
+				{in: AddLineItemInput{CallerAccountID: "intruder", ItemID: "i1", Description: "Sneaky", Amount: dec("10.00"), Currency: CurrencyUSD}, wantRejected: true},
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "i2", Description: "Valid", Amount: dec("3.00"), Currency: CurrencyUSD}},
+			},
+			wantTotal: dec("3.00"),
+			wantItems: 1,
+		},
+		{
+			name:  "wrong currency item rejected by validator",
+			input: BillWorkflowInput{AccountID: wfTestAccountID, BillID: "bill-3", Currency: CurrencyUSD},
+			adds: []addStep{
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "i1", Description: "Valid", Amount: dec("10.00"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "i2", Description: "Invalid GEL", Amount: dec("5.00"), Currency: CurrencyGEL}, wantRejected: true},
 			},
 			wantTotal: dec("10.00"),
 			wantItems: 1,
 		},
 		{
 			name:  "idempotent - duplicate item ID ignored",
-			input: BillWorkflowInput{BillID: "bill-4", Currency: CurrencyUSD},
+			input: BillWorkflowInput{AccountID: wfTestAccountID, BillID: "bill-4", Currency: CurrencyUSD},
 			adds: []addStep{
-				{in: AddLineItemInput{ItemID: "dup", Description: "First", Amount: dec("10.00"), Currency: CurrencyUSD}},
-				{in: AddLineItemInput{ItemID: "dup", Description: "Duplicate", Amount: dec("10.00"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "dup", Description: "First", Amount: dec("10.00"), Currency: CurrencyUSD}},
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "dup", Description: "Duplicate", Amount: dec("10.00"), Currency: CurrencyUSD}},
 			},
 			wantTotal: dec("10.00"),
 			wantItems: 1,
 		},
 		{
 			name:  "JPY bill (zero decimals) works",
-			input: BillWorkflowInput{BillID: "bill-jpy", Currency: "JPY"},
+			input: BillWorkflowInput{AccountID: wfTestAccountID, BillID: "bill-jpy", Currency: "JPY"},
 			adds: []addStep{
-				{in: AddLineItemInput{ItemID: "j1", Description: "Yen fee", Amount: dec("1000"), Currency: "JPY"}},
-				{in: AddLineItemInput{ItemID: "j2", Description: "Yen fee 2", Amount: dec("500"), Currency: "JPY"}},
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "j1", Description: "Yen fee", Amount: dec("1000"), Currency: "JPY"}},
+				{in: AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "j2", Description: "Yen fee 2", Amount: dec("500"), Currency: "JPY"}},
 			},
 			wantTotal: dec("1500"),
 			wantItems: 2,
@@ -146,11 +162,12 @@ func TestBillingWorkflow_PeriodEndAutoCloses(t *testing.T) {
 			OnAccept:   func() {},
 			OnReject:   func(err error) { t.Errorf("rejected: %v", err) },
 			OnComplete: func(_ interface{}, err error) { assert.NoError(t, err) },
-		}, AddLineItemInput{ItemID: "i1", Description: "Fee", Amount: dec("10.00"), Currency: CurrencyUSD})
+		}, AddLineItemInput{CallerAccountID: wfTestAccountID, ItemID: "i1", Description: "Fee", Amount: dec("10.00"), Currency: CurrencyUSD})
 	}, time.Millisecond)
 
 	env.ExecuteWorkflow(BillingWorkflow, BillWorkflowInput{
 		BillID:    "bill-period",
+		AccountID: wfTestAccountID,
 		Currency:  CurrencyUSD,
 		PeriodEnd: &end,
 	})
@@ -211,7 +228,7 @@ func TestBillingWorkflow_ActivityRetried(t *testing.T) {
 		env.SignalWorkflow(SignalCloseBill, CloseBillSignal{})
 	}, time.Millisecond)
 
-	env.ExecuteWorkflow(BillingWorkflow, BillWorkflowInput{BillID: "retry-bill", Currency: CurrencyUSD})
+	env.ExecuteWorkflow(BillingWorkflow, BillWorkflowInput{AccountID: wfTestAccountID, BillID: "retry-bill", Currency: CurrencyUSD})
 
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())

@@ -5,7 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"encore.dev/beta/auth"
 	"encore.dev/beta/errs"
+	"encore.dev/et"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
@@ -17,19 +19,35 @@ import (
 	"go.temporal.io/sdk/temporal"
 )
 
+const testAccountID = "acct-test"
+
+// withTestAuth sets the per-test auth identity so endpoint methods
+// that call callerAccountID see a non-empty account. Without this,
+// auth.Data() returns nil and ownership checks fail.
+func withTestAuth(t *testing.T) {
+	t.Helper()
+	et.OverrideAuthInfo(auth.UID(testAccountID), &AuthData{AccountID: testAccountID})
+}
+
 type mockQueryResult struct {
 	mock.Mock
+	fill *Bill
 }
 
 func (m *mockQueryResult) Get(valuePtr interface{}) error {
 	args := m.Called(valuePtr)
 	if bill, ok := valuePtr.(*Bill); ok && args.Error(0) == nil {
-		*bill = Bill{
-			ID:          "test-id",
-			Status:      BillStatusOpen,
-			Currency:    CurrencyUSD,
-			LineItems:   []LineItem{},
-			TotalAmount: decimal.Zero,
+		if m.fill != nil {
+			*bill = *m.fill
+		} else {
+			*bill = Bill{
+				ID:          "test-id",
+				AccountID:   testAccountID,
+				Status:      BillStatusOpen,
+				Currency:    CurrencyUSD,
+				LineItems:   []LineItem{},
+				TotalAmount: decimal.Zero,
+			}
 		}
 	}
 	return args.Error(0)
@@ -46,6 +64,7 @@ func newTestService(t *testing.T) (*Service, *mocks.Client) {
 }
 
 func TestCreateBill_InvalidCurrency(t *testing.T) {
+	withTestAuth(t)
 	svc, _ := newTestService(t)
 
 	_, err := svc.CreateBill(context.Background(), &CreateBillRequest{
@@ -57,6 +76,7 @@ func TestCreateBill_InvalidCurrency(t *testing.T) {
 }
 
 func TestCreateBill_Success(t *testing.T) {
+	withTestAuth(t)
 	svc, mockClient := newTestService(t)
 
 	mockRun := &mocks.WorkflowRun{}
@@ -110,6 +130,7 @@ func TestAddLineItem_InvalidInput(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			withTestAuth(t)
 			svc, _ := newTestService(t)
 			_, err := svc.AddLineItem(context.Background(), "bill-1", tt.req)
 			require.Error(t, err)
@@ -119,6 +140,7 @@ func TestAddLineItem_InvalidInput(t *testing.T) {
 }
 
 func TestAddLineItem_ClosedBill(t *testing.T) {
+	withTestAuth(t)
 	svc, mockClient := newTestService(t)
 
 	mockClient.On("UpdateWorkflow",
@@ -160,6 +182,7 @@ func TestClassifyUpdateError_OtherAppErrorIsInvalidArgument(t *testing.T) {
 }
 
 func TestAddLineItem_TemporalUnavailable(t *testing.T) {
+	withTestAuth(t)
 	svc, mockClient := newTestService(t)
 
 	mockClient.On("UpdateWorkflow",
@@ -178,6 +201,7 @@ func TestAddLineItem_TemporalUnavailable(t *testing.T) {
 }
 
 func TestAddLineItem_ContextCanceled(t *testing.T) {
+	withTestAuth(t)
 	svc, mockClient := newTestService(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -198,20 +222,32 @@ func TestAddLineItem_ContextCanceled(t *testing.T) {
 	assert.Contains(t, err.Error(), "canceled")
 }
 
+func TestAddLineItem_BillNotFoundFromOwnershipMismatch(t *testing.T) {
+	// The workflow validator rejects updates whose CallerAccountID does
+	// not match the bill's AccountID. The endpoint must surface that as
+	// a 404 — not a 403 — so non-owners cannot probe for the existence
+	// of other tenants' bill IDs.
+	notFoundErr := temporal.NewApplicationError("bill not found", billNotFoundErrType)
+	e := classifyUpdateError(notFoundErr)
+	require.NotNil(t, e)
+	assert.Equal(t, errs.NotFound, e.Code)
+}
+
 func TestCloseBill_WorkflowNotFound_NoDBRow(t *testing.T) {
 	// True 404: workflow is gone AND no persisted bill row exists.
-	// closeBillFromDB → sqldb.ErrNoRows → NotFound. Use a well-formed
-	// UUID so we exercise the no-rows path, not the column-type reject.
+	// assertOwnsBill → loadBill → QueryWorkflow returns NotFound → DB
+	// returns ErrNoRows → endpoint surfaces NotFound. SignalWorkflow
+	// is never reached because the ownership pre-check short-circuits.
+	withTestAuth(t)
 	svc, mockClient := newTestService(t)
 	missingID := uuid.NewString()
 
-	mockClient.On("SignalWorkflow",
+	mockClient.On("QueryWorkflow",
 		mock.Anything,
 		"bill-"+missingID,
 		"",
-		SignalCloseBill,
-		mock.Anything,
-	).Return(&serviceerror.NotFound{Message: "workflow not found"})
+		QueryBillState,
+	).Return((*mockQueryResult)(nil), &serviceerror.NotFound{Message: "workflow not found"})
 
 	_, err := svc.CloseBill(context.Background(), missingID)
 
@@ -223,9 +259,11 @@ func TestCloseBill_WorkflowNotFound_NoDBRow(t *testing.T) {
 
 func TestCloseBill_IdempotentRetryReturnsPersistedBill(t *testing.T) {
 	// Workflow already completed (e.g. previous successful close, or
-	// period-end timer fired). SignalWorkflow → NotFound, but the bill
-	// row is in the DB. Endpoint must return 200 with persisted state,
-	// not a 404.
+	// period-end timer fired). Ownership pre-check loads from DB
+	// (Temporal NotFound → fallback), confirms account match, then
+	// SignalWorkflow also returns NotFound — endpoint returns 200 with
+	// persisted state.
+	withTestAuth(t)
 	svc, mockClient := newTestService(t)
 
 	billID := uuid.NewString()
@@ -233,14 +271,21 @@ func TestCloseBill_IdempotentRetryReturnsPersistedBill(t *testing.T) {
 	createdAt := closedAt.Add(-time.Hour)
 
 	_, err := db.Exec(context.Background(), `
-		INSERT INTO bills (id, status, currency, total_amount, created_at, closed_at, close_reason)
-		VALUES ($1, 'CLOSED', 'USD', $2, $3, $4, 'SIGNAL')`,
-		billID, decimal.RequireFromString("42.50"), createdAt, closedAt,
+		INSERT INTO bills (id, account_id, status, currency, total_amount, created_at, closed_at, close_reason)
+		VALUES ($1, $2, 'CLOSED', 'USD', $3, $4, $5, 'SIGNAL')`,
+		billID, testAccountID, decimal.RequireFromString("42.50"), createdAt, closedAt,
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		_, _ = db.Exec(context.Background(), `DELETE FROM bills WHERE id = $1`, billID)
 	})
+
+	mockClient.On("QueryWorkflow",
+		mock.Anything,
+		"bill-"+billID,
+		"",
+		QueryBillState,
+	).Return((*mockQueryResult)(nil), &serviceerror.NotFound{Message: "workflow not found"})
 
 	mockClient.On("SignalWorkflow",
 		mock.Anything,
@@ -257,7 +302,39 @@ func TestCloseBill_IdempotentRetryReturnsPersistedBill(t *testing.T) {
 	assert.True(t, decimal.RequireFromString("42.50").Equal(resp.TotalAmount))
 }
 
+func TestCloseBill_OwnershipMismatchReturns404(t *testing.T) {
+	// Bill belongs to another account. assertOwnsBill returns NotFound
+	// (not PermissionDenied) so existence is not leaked.
+	withTestAuth(t)
+	svc, mockClient := newTestService(t)
+
+	billID := uuid.NewString()
+	_, err := db.Exec(context.Background(), `
+		INSERT INTO bills (id, account_id, status, currency, total_amount, created_at)
+		VALUES ($1, 'other-account', 'OPEN', 'USD', 0, NOW())`,
+		billID,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DELETE FROM bills WHERE id = $1`, billID)
+	})
+
+	mockClient.On("QueryWorkflow",
+		mock.Anything,
+		"bill-"+billID,
+		"",
+		QueryBillState,
+	).Return((*mockQueryResult)(nil), &serviceerror.NotFound{Message: "workflow not found"})
+
+	_, err = svc.CloseBill(context.Background(), billID)
+	require.Error(t, err)
+	var e *errs.Error
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.NotFound, e.Code)
+}
+
 func TestGetBill_FromWorkflow(t *testing.T) {
+	withTestAuth(t)
 	svc, mockClient := newTestService(t)
 
 	qr := &mockQueryResult{}
@@ -281,6 +358,7 @@ func TestGetBill_QueryUnavailable(t *testing.T) {
 	// A non-NotFound query error (e.g. Temporal briefly unavailable or
 	// context canceled) must NOT degrade to a DB lookup, otherwise an open
 	// bill that lives only in workflow memory gets reported as 404.
+	withTestAuth(t)
 	svc, mockClient := newTestService(t)
 
 	mockClient.On("QueryWorkflow",
@@ -295,6 +373,50 @@ func TestGetBill_QueryUnavailable(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to query bill")
 	assert.NotContains(t, err.Error(), "not found")
+}
+
+func TestGetBill_OwnershipMismatchReturns404(t *testing.T) {
+	withTestAuth(t)
+	svc, mockClient := newTestService(t)
+
+	qr := &mockQueryResult{
+		fill: &Bill{
+			ID:        "test-id",
+			AccountID: "other-account",
+			Status:    BillStatusOpen,
+			Currency:  CurrencyUSD,
+		},
+	}
+	qr.On("Get", mock.AnythingOfType("*bill.Bill")).Return(nil)
+
+	mockClient.On("QueryWorkflow",
+		mock.Anything,
+		"bill-existing",
+		"",
+		QueryBillState,
+	).Return(qr, nil)
+
+	_, err := svc.GetBill(context.Background(), "existing")
+	require.Error(t, err)
+	var e *errs.Error
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.NotFound, e.Code)
+}
+
+func TestAuthHandler_RejectsMissingHeader(t *testing.T) {
+	_, _, err := AuthHandler(context.Background(), &AuthParams{AccountID: ""})
+	require.Error(t, err)
+	var e *errs.Error
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.Unauthenticated, e.Code)
+}
+
+func TestAuthHandler_AcceptsNonEmptyHeader(t *testing.T) {
+	uid, data, err := AuthHandler(context.Background(), &AuthParams{AccountID: "acct-42"})
+	require.NoError(t, err)
+	assert.Equal(t, auth.UID("acct-42"), uid)
+	require.NotNil(t, data)
+	assert.Equal(t, "acct-42", data.AccountID)
 }
 
 func TestMoney_DisplayAmount(t *testing.T) {

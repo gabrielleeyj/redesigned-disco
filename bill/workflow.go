@@ -19,6 +19,12 @@ const continueAsNewThreshold = 1000
 // FailedPrecondition (409) instead of a generic InvalidArgument.
 const currencyMismatchErrType = "CurrencyMismatch"
 
+// billNotFoundErrType is the ApplicationError type used by the
+// AddLineItem validator when the caller's account does not own the
+// bill. Surfaced as 404 NotFound at the API boundary so existence is
+// not leaked to non-owners.
+const billNotFoundErrType = "BillNotFound"
+
 // BillingWorkflow is the Temporal workflow that backs a bill's lifecycle.
 // It accumulates line items via the AddLineItem update, completes on the
 // CloseBill signal or when the period-end timer fires, and persists the
@@ -127,6 +133,17 @@ func registerAddLineItemHandler(ctx workflow.Context, bill *Bill, seen map[strin
 		},
 		workflow.UpdateHandlerOptions{
 			Validator: func(ctx workflow.Context, in AddLineItemInput) error {
+				// Ownership check first — do not reveal currency,
+				// amount, or any other detail to non-owners. The
+				// API layer is the only trusted source of
+				// CallerAccountID; user-supplied values cannot
+				// reach this field.
+				if in.CallerAccountID != bill.AccountID {
+					return temporal.NewApplicationError(
+						"bill not found",
+						billNotFoundErrType,
+					)
+				}
 				if in.Currency != bill.Currency {
 					return temporal.NewApplicationError(
 						fmt.Sprintf("currency mismatch: bill is %s, item is %s", bill.Currency, in.Currency),
@@ -153,6 +170,7 @@ func continueAsNew(ctx workflow.Context, input BillWorkflowInput, bill Bill) err
 	snapshot.LineItems = append([]LineItem(nil), bill.LineItems...)
 	return workflow.NewContinueAsNewError(ctx, BillingWorkflow, BillWorkflowInput{
 		BillID:      input.BillID,
+		AccountID:   input.AccountID,
 		Currency:    input.Currency,
 		PeriodStart: input.PeriodStart,
 		PeriodEnd:   input.PeriodEnd,
@@ -195,6 +213,7 @@ func initialBill(ctx workflow.Context, input BillWorkflowInput) Bill {
 	}
 	return Bill{
 		ID:          input.BillID,
+		AccountID:   input.AccountID,
 		Status:      BillStatusOpen,
 		Currency:    input.Currency,
 		LineItems:   []LineItem{},

@@ -107,6 +107,7 @@ type LineItem struct {
 // activity persists it on close.
 type Bill struct {
 	ID          string          `json:"id"`
+	AccountID   string          `json:"accountId"`
 	Status      BillStatus      `json:"status"`
 	Currency    Currency        `json:"currency"`
 	LineItems   []LineItem      `json:"lineItems"`
@@ -121,6 +122,7 @@ type Bill struct {
 // BillWorkflowInput is the argument to BillingWorkflow.
 type BillWorkflowInput struct {
 	BillID      string     `json:"billId"`
+	AccountID   string     `json:"accountId"`
 	Currency    Currency   `json:"currency"`
 	PeriodStart *time.Time `json:"periodStart,omitempty"`
 	PeriodEnd   *time.Time `json:"periodEnd,omitempty"`

@@ -43,7 +43,7 @@ type CreateBillResponse struct {
 	PeriodEnd   *time.Time `json:"periodEnd,omitempty"`
 }
 
-//encore:api public method=POST path=/bills
+//encore:api auth method=POST path=/bills
 func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*CreateBillResponse, error) {
 	currency := Currency(req.Currency)
 	if !currency.Valid() {
@@ -56,11 +56,13 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Crea
 		return nil, err
 	}
 
+	accountID := callerAccountID(ctx)
 	billID := uuid.New().String()
 	workflowID := fmt.Sprintf("bill-%s", billID)
 
 	input := BillWorkflowInput{
 		BillID:      billID,
+		AccountID:   accountID,
 		Currency:    currency,
 		PeriodStart: req.PeriodStart,
 		PeriodEnd:   req.PeriodEnd,
@@ -119,7 +121,7 @@ type AddLineItemResponse struct {
 	ItemCount int             `json:"itemCount"`
 }
 
-//encore:api public method=POST path=/bills/:id/line-items
+//encore:api auth method=POST path=/bills/:id/line-items
 func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRequest) (*AddLineItemResponse, error) {
 	if req.Description == "" {
 		return nil, &errs.Error{
@@ -149,10 +151,11 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 	workflowID := fmt.Sprintf("bill-%s", id)
 
 	in := AddLineItemInput{
-		ItemID:      itemID,
-		Description: req.Description,
-		Amount:      req.Amount,
-		Currency:    currency,
+		ItemID:          itemID,
+		Description:     req.Description,
+		Amount:          req.Amount,
+		Currency:        currency,
+		CallerAccountID: callerAccountID(ctx),
 	}
 
 	handle, err := s.temporalClient.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
@@ -222,7 +225,13 @@ func mapTemporalRPCError(err error, op string) *errs.Error {
 func classifyUpdateError(err error) *errs.Error {
 	var appErr *temporal.ApplicationError
 	if errors.As(err, &appErr) {
-		if appErr.Type() == currencyMismatchErrType {
+		switch appErr.Type() {
+		case billNotFoundErrType:
+			return &errs.Error{
+				Code:    errs.NotFound,
+				Message: appErr.Message(),
+			}
+		case currencyMismatchErrType:
 			return &errs.Error{
 				Code:    errs.FailedPrecondition,
 				Message: appErr.Message(),
@@ -264,7 +273,7 @@ type CloseBillResponse struct {
 	CloseReason CloseReason     `json:"closeReason,omitempty"`
 }
 
-//encore:api public method=POST path=/bills/:id/close
+//encore:api auth method=POST path=/bills/:id/close
 //
 // CloseBill is idempotent. If the workflow has already completed (e.g.
 // the caller is retrying a successful close, or the period-end timer
@@ -272,6 +281,9 @@ type CloseBillResponse struct {
 // same response shape as a first-time close. Only an unknown bill ID
 // produces a 404.
 func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse, error) {
+	if err := s.assertOwnsBill(ctx, id); err != nil {
+		return nil, err
+	}
 	workflowID := fmt.Sprintf("bill-%s", id)
 
 	err := s.temporalClient.SignalWorkflow(ctx, workflowID, emptyRunID, SignalCloseBill, CloseBillSignal{})
@@ -331,38 +343,87 @@ type GetBillResponse struct {
 	Bill Bill `json:"bill"`
 }
 
-//encore:api public method=GET path=/bills/:id
+//encore:api auth method=GET path=/bills/:id
 func (s *Service) GetBill(ctx context.Context, id string) (*GetBillResponse, error) {
-	workflowID := fmt.Sprintf("bill-%s", id)
-
-	state, err := s.queryBillState(ctx, workflowID)
-	if err == nil {
-		return &GetBillResponse{Bill: state}, nil
-	}
-
-	// Only fall back to the DB when Temporal tells us the workflow is gone
-	// (NotFound). Open bills exist only in workflow memory until CloseBill
-	// persists them — if the query failed for any other reason (Temporal
-	// unavailable, context canceled, network blip) we'd report a false 404
-	// for a live bill. Surface those as Unavailable instead.
-	var notFound *serviceerror.NotFound
-	if !errors.As(err, &notFound) {
-		rlog.Error("bill workflow query failed", "bill_id", id, "err", err)
-		return nil, &errs.Error{
-			Code:    errs.Unavailable,
-			Message: "failed to query bill",
-		}
-	}
-
-	bill, err := s.getBillFromDB(ctx, id)
+	bill, err := s.loadBill(ctx, id)
 	if err != nil {
+		return nil, err
+	}
+	if bill.AccountID != callerAccountID(ctx) {
+		// Return NotFound (not PermissionDenied) so existence does not
+		// leak to non-owners — a tenancy-scoped 404 is the same answer
+		// the caller would get for a typo'd ID.
 		return nil, &errs.Error{
 			Code:    errs.NotFound,
 			Message: fmt.Sprintf("bill %s not found", id),
 		}
 	}
-
 	return &GetBillResponse{Bill: bill}, nil
+}
+
+// loadBill resolves a bill ID to its current state via Temporal query
+// (open bills) with a DB fallback (closed bills). Returns an
+// errs.Error with the appropriate code; callers should not wrap.
+//
+// Only NotFound from Temporal triggers the DB fallback. A non-NotFound
+// query error (Temporal unavailable, context canceled) must NOT
+// degrade to a DB lookup or an in-flight bill that lives only in
+// workflow memory would report as 404.
+func (s *Service) loadBill(ctx context.Context, id string) (Bill, error) {
+	workflowID := fmt.Sprintf("bill-%s", id)
+
+	state, err := s.queryBillState(ctx, workflowID)
+	if err == nil {
+		return state, nil
+	}
+
+	var notFound *serviceerror.NotFound
+	if !errors.As(err, &notFound) {
+		rlog.Error("bill workflow query failed", "bill_id", id, "err", err)
+		return Bill{}, &errs.Error{
+			Code:    errs.Unavailable,
+			Message: "failed to query bill",
+		}
+	}
+
+	bill, dberr := s.getBillFromDB(ctx, id)
+	if dberr != nil {
+		if errors.Is(dberr, sqldb.ErrNoRows) {
+			return Bill{}, &errs.Error{
+				Code:    errs.NotFound,
+				Message: fmt.Sprintf("bill %s not found", id),
+			}
+		}
+		rlog.Error("bill DB load failed", "bill_id", id, "err", dberr)
+		return Bill{}, &errs.Error{
+			Code:    errs.Internal,
+			Message: "failed to load bill",
+		}
+	}
+	return bill, nil
+}
+
+// assertOwnsBill loads the bill and verifies the caller owns it. Used
+// as a pre-check on per-bill mutating endpoints. Returns NotFound
+// (404) for both "bill does not exist" and "bill belongs to another
+// account" so existence isn't leaked across tenants.
+//
+// Cost: one extra round-trip (Temporal query or DB read) per
+// mutating call. Acceptable for the stub; a production design would
+// either cache the account_id by bill_id locally or push the check
+// into the workflow validator on AddLineItem.
+func (s *Service) assertOwnsBill(ctx context.Context, id string) error {
+	bill, err := s.loadBill(ctx, id)
+	if err != nil {
+		return err
+	}
+	if bill.AccountID != callerAccountID(ctx) {
+		return &errs.Error{
+			Code:    errs.NotFound,
+			Message: fmt.Sprintf("bill %s not found", id),
+		}
+	}
+	return nil
 }
 
 type ListBillsRequest struct {
@@ -376,7 +437,7 @@ type ListBillsResponse struct {
 	Offset int    `json:"offset"`
 }
 
-//encore:api public method=GET path=/bills
+//encore:api auth method=GET path=/bills
 func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBillsResponse, error) {
 	if req != nil && (req.Limit < 0 || req.Offset < 0) {
 		return nil, &errs.Error{
@@ -387,10 +448,12 @@ func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBi
 	limit, offset := normalizeListPagination(req)
 
 	rows, err := db.Query(ctx, `
-		SELECT id, status, currency, total_amount, created_at, closed_at,
+		SELECT id, account_id, status, currency, total_amount, created_at, closed_at,
 		       period_start, period_end, close_reason
-		FROM bills ORDER BY created_at DESC
-		LIMIT $1 OFFSET $2`, limit, offset)
+		FROM bills
+		WHERE account_id = $1
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3`, callerAccountID(ctx), limit, offset)
 	if err != nil {
 		return nil, &errs.Error{
 			Code:    errs.Internal,
@@ -450,7 +513,7 @@ func scanBillRow(s rowScanner) (Bill, error) {
 		closeReason *string
 	)
 	if err := s.Scan(
-		&b.ID, &b.Status, &b.Currency, &b.TotalAmount, &b.CreatedAt, &b.ClosedAt,
+		&b.ID, &b.AccountID, &b.Status, &b.Currency, &b.TotalAmount, &b.CreatedAt, &b.ClosedAt,
 		&b.PeriodStart, &b.PeriodEnd, &closeReason,
 	); err != nil {
 		return Bill{}, err
@@ -474,7 +537,7 @@ func (s *Service) queryBillState(ctx context.Context, workflowID string) (Bill, 
 
 func (s *Service) getBillFromDB(ctx context.Context, id string) (Bill, error) {
 	row := db.QueryRow(ctx, `
-		SELECT id, status, currency, total_amount, created_at, closed_at,
+		SELECT id, account_id, status, currency, total_amount, created_at, closed_at,
 		       period_start, period_end, close_reason
 		FROM bills WHERE id = $1`, id)
 	b, err := scanBillRow(row)

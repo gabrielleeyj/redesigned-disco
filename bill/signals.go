@@ -16,11 +16,17 @@ const (
 )
 
 // AddLineItemInput is the payload of the AddLineItem update.
+//
+// CallerAccountID is the asserted identity from the auth handler. The
+// validator rejects the update if it does not match the bill's owner;
+// callers must NOT set this from user input. The API layer is the only
+// trusted source for this field.
 type AddLineItemInput struct {
-	ItemID      string          `json:"itemId"`
-	Description string          `json:"description"`
-	Amount      decimal.Decimal `json:"amount"`
-	Currency    Currency        `json:"currency"`
+	ItemID          string          `json:"itemId"`
+	Description     string          `json:"description"`
+	Amount          decimal.Decimal `json:"amount"`
+	Currency        Currency        `json:"currency"`
+	CallerAccountID string          `json:"callerAccountId"`
 }
 
 // AddLineItemResult is the return value of the AddLineItem update.
