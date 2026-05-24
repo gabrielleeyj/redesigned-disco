@@ -281,6 +281,13 @@ func mapTemporalRPCError(err error, op string) *errs.Error {
 func classifyUpdateError(err error) *errs.Error {
 	var appErr *temporal.ApplicationError
 	if errors.As(err, &appErr) {
+		reason := appErr.Type()
+		if reason == "" {
+			reason = "InvalidInput"
+		}
+		lineItemValidatorRejectionTotal.With(validatorRejectionLabels{Reason: reason}).Increment()
+		lineItemsAddedTotal.With(lineItemResultLabels{Result: "rejected"}).Increment()
+
 		switch appErr.Type() {
 		case billNotFoundErrType:
 			return &errs.Error{

@@ -53,7 +53,11 @@ func CreateBillActivity(ctx context.Context, bill Bill) error {
 			"periodStart": bill.PeriodStart,
 			"periodEnd":   bill.PeriodEnd,
 		})
-		return appendEvent(ctx, tx, bill.ID, BillEventOpened, bill.AccountID, payload)
+		if err := appendEvent(ctx, tx, bill.ID, BillEventOpened, bill.AccountID, payload); err != nil {
+			return err
+		}
+		billsOpenedTotal.With(currencyLabels{Currency: string(bill.Currency)}).Increment()
+		return nil
 	})
 }
 
@@ -74,6 +78,7 @@ func AppendLineItemActivity(ctx context.Context, in AppendLineItemInput) error {
 		).Scan(&inserted)
 		if err != nil {
 			if errors.Is(err, sqldb.ErrNoRows) {
+				lineItemsAddedTotal.With(lineItemResultLabels{Result: "duplicate"}).Increment()
 				return nil // duplicate retry; total and event already recorded
 			}
 			return fmt.Errorf("insert line item %s: %w", in.Item.ID, err)
@@ -92,7 +97,11 @@ func AppendLineItemActivity(ctx context.Context, in AppendLineItemInput) error {
 			"amount":      in.Item.Amount.String(),
 			"currency":    in.Item.Currency,
 		})
-		return appendEvent(ctx, tx, in.BillID, BillEventItemAdded, in.Actor, payload)
+		if err := appendEvent(ctx, tx, in.BillID, BillEventItemAdded, in.Actor, payload); err != nil {
+			return err
+		}
+		lineItemsAddedTotal.With(lineItemResultLabels{Result: "accepted"}).Increment()
+		return nil
 	})
 }
 
@@ -119,7 +128,11 @@ func CloseBillActivity(ctx context.Context, in CloseBillActivityInput) error {
 			"totalAmount": in.TotalAmount.String(),
 			"closeReason": in.CloseReason,
 		})
-		return appendEvent(ctx, tx, in.BillID, BillEventClosed, in.Actor, payload)
+		if err := appendEvent(ctx, tx, in.BillID, BillEventClosed, in.Actor, payload); err != nil {
+			return err
+		}
+		billsClosedTotal.With(closeReasonLabels{Reason: string(in.CloseReason)}).Increment()
+		return nil
 	})
 }
 
