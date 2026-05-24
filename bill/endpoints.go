@@ -18,13 +18,27 @@ import (
 	"go.temporal.io/sdk/temporal"
 )
 
-// emptyRunID targets the latest run of a workflow ID. Required when the
-// workflow may have transitioned through ContinueAsNew.
-const emptyRunID = ""
+// latestRunID is the conventional empty-string value passed to
+// Temporal client methods to target the most recent run of a
+// workflow ID — required when the workflow may have transitioned
+// through ContinueAsNew. Defined as a typed constant so the meaning
+// is clear at call sites; the literal "" reads as a bug.
+const latestRunID = ""
 
 const (
 	defaultListLimit = 50
 	maxListLimit     = 500
+)
+
+// temporalOp enumerates the RPC operations the endpoint layer
+// classifies. Using a typed enum (not a free-form string from the
+// caller) means user-controlled input cannot end up in error messages
+// returned to clients.
+type temporalOp string
+
+const (
+	temporalOpAddItem   temporalOp = "add item"
+	temporalOpCloseBill temporalOp = "close bill"
 )
 
 type CreateBillRequest struct {
@@ -216,13 +230,13 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 
 	handle, err := s.temporalClient.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
 		WorkflowID:   workflowID,
-		RunID:        emptyRunID,
+		RunID:        latestRunID,
 		UpdateName:   UpdateAddLineItem,
 		Args:         []interface{}{in},
 		WaitForStage: client.WorkflowUpdateStageCompleted,
 	})
 	if err != nil {
-		return nil, mapTemporalRPCError(err, "add item")
+		return nil, mapTemporalRPCError(err, temporalOpAddItem)
 	}
 
 	var result AddLineItemResult
@@ -237,12 +251,16 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 	}, nil
 }
 
-// mapTemporalRPCError classifies an error returned by submitting a signal
-// or update to Temporal. Only NotFound and "workflow already completed"
-// indicate the bill is gone or closed — every other Temporal RPC failure
-// is an infrastructure error and must not be reported to callers as a
-// business-state error, or they may stop retrying on a transient outage.
-func mapTemporalRPCError(err error, op string) *errs.Error {
+// mapTemporalRPCError classifies an error returned by submitting a
+// signal or update to Temporal. Only NotFound and "workflow already
+// completed" indicate the bill is gone or closed — every other
+// Temporal RPC failure is an infrastructure error and must not be
+// reported to callers as a business-state error, or they may stop
+// retrying on a transient outage.
+//
+// op is a typed enum (not a free-form caller string) so user input
+// cannot end up in returned error messages.
+func mapTemporalRPCError(err error, op temporalOp) *errs.Error {
 	var notFound *serviceerror.NotFound
 	if errors.As(err, &notFound) {
 		return &errs.Error{
@@ -262,7 +280,7 @@ func mapTemporalRPCError(err error, op string) *errs.Error {
 			Message: fmt.Sprintf("cannot %s: deadline exceeded", op),
 		}
 	}
-	rlog.Error("temporal rpc failed", "op", op, "err", err)
+	rlog.Error("temporal rpc failed", "op", string(op), "err", err)
 	return &errs.Error{
 		Code:    errs.Unavailable,
 		Message: fmt.Sprintf("cannot %s: service unavailable", op),
@@ -349,16 +367,16 @@ func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse,
 	}
 	workflowID := fmt.Sprintf("bill-%s", id)
 
-	err := s.temporalClient.SignalWorkflow(ctx, workflowID, emptyRunID, SignalCloseBill, CloseBillSignal{})
+	err := s.temporalClient.SignalWorkflow(ctx, workflowID, latestRunID, SignalCloseBill, CloseBillSignal{})
 	if err != nil {
 		var notFound *serviceerror.NotFound
 		if errors.As(err, &notFound) {
 			return s.closeBillFromDB(ctx, id)
 		}
-		return nil, mapTemporalRPCError(err, "close bill")
+		return nil, mapTemporalRPCError(err, temporalOpCloseBill)
 	}
 
-	run := s.temporalClient.GetWorkflow(ctx, workflowID, emptyRunID)
+	run := s.temporalClient.GetWorkflow(ctx, workflowID, latestRunID)
 	var result BillResult
 	if err := run.Get(ctx, &result); err != nil {
 		rlog.Error("close bill workflow failed", "bill_id", id, "err", err)
@@ -964,7 +982,7 @@ func scanBillRow(s rowScanner) (Bill, error) {
 }
 
 func (s *Service) queryBillState(ctx context.Context, workflowID string) (Bill, error) {
-	resp, err := s.temporalClient.QueryWorkflow(ctx, workflowID, emptyRunID, QueryBillState)
+	resp, err := s.temporalClient.QueryWorkflow(ctx, workflowID, latestRunID, QueryBillState)
 	if err != nil {
 		return Bill{}, err
 	}

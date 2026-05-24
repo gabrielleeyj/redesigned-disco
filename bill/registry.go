@@ -2,7 +2,6 @@ package bill
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"time"
 
@@ -103,15 +102,9 @@ func loadCurrenciesFromDB(ctx context.Context) (map[Currency]CurrencyMeta, error
 
 	out := make(map[Currency]CurrencyMeta)
 	for rows.Next() {
-		var (
-			meta        CurrencyMeta
-			numericCode sql.NullInt32
-		)
-		if err := rows.Scan(&meta.Code, &meta.Name, &numericCode, &meta.Decimals); err != nil {
+		var meta CurrencyMeta
+		if err := rows.Scan(&meta.Code, &meta.Name, &meta.NumericCode, &meta.Decimals); err != nil {
 			return nil, fmt.Errorf("scan currency: %w", err)
-		}
-		if numericCode.Valid {
-			meta.NumericCode = int(numericCode.Int32)
 		}
 		out[Currency(meta.Code)] = meta
 	}
