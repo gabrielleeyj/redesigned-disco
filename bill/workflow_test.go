@@ -27,6 +27,18 @@ func dec(s string) decimal.Decimal { return decimal.RequireFromString(s) }
 // updates to pass.
 const wfTestAccountID = "acct-wf-test"
 
+// registerAndStubActivities wires the workflow's DB activities to
+// no-op stubs in the test environment. Real DB writes happen in
+// integration tests; here we just exercise workflow logic.
+func registerAndStubActivities(env *testsuite.TestWorkflowEnvironment) {
+	env.RegisterActivity(CreateBillActivity)
+	env.RegisterActivity(AppendLineItemActivity)
+	env.RegisterActivity(CloseBillActivity)
+	env.OnActivity(CreateBillActivity, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(AppendLineItemActivity, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(CloseBillActivity, mock.Anything, mock.Anything).Return(nil)
+}
+
 func TestBillingWorkflow(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -110,8 +122,7 @@ func TestBillingWorkflow(t *testing.T) {
 			suite := &testsuite.WorkflowTestSuite{}
 			env := suite.NewTestWorkflowEnvironment()
 
-			env.RegisterActivity(PersistBillActivity)
-			env.OnActivity(PersistBillActivity, mock.Anything, mock.Anything).Return(nil)
+			registerAndStubActivities(env)
 
 			for i, step := range tt.adds {
 				step := step
@@ -148,8 +159,7 @@ func TestBillingWorkflow_PeriodEndAutoCloses(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestWorkflowEnvironment()
 
-	env.RegisterActivity(PersistBillActivity)
-	env.OnActivity(PersistBillActivity, mock.Anything, mock.Anything).Return(nil)
+	registerAndStubActivities(env)
 
 	// Test environment advances mock time as registered callbacks fire.
 	// Setting PeriodEnd to start+1h with an item added at t=1ms exercises
@@ -185,8 +195,7 @@ func TestBillingWorkflow_SignalBeatsTimer(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestWorkflowEnvironment()
 
-	env.RegisterActivity(PersistBillActivity)
-	env.OnActivity(PersistBillActivity, mock.Anything, mock.Anything).Return(nil)
+	registerAndStubActivities(env)
 
 	// PeriodEnd far in the future; CloseBill arrives first → reason=SIGNAL.
 	end := time.Now().Add(24 * time.Hour)
@@ -197,6 +206,7 @@ func TestBillingWorkflow_SignalBeatsTimer(t *testing.T) {
 
 	env.ExecuteWorkflow(BillingWorkflow, BillWorkflowInput{
 		BillID:    "bill-signal-wins",
+		AccountID: wfTestAccountID,
 		Currency:  CurrencyUSD,
 		PeriodEnd: &end,
 	})
@@ -209,14 +219,19 @@ func TestBillingWorkflow_SignalBeatsTimer(t *testing.T) {
 	assert.Equal(t, CloseReasonSignal, result.CloseReason)
 }
 
-func TestBillingWorkflow_ActivityRetried(t *testing.T) {
+func TestBillingWorkflow_CloseActivityRetried(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestWorkflowEnvironment()
 
-	env.RegisterActivity(PersistBillActivity)
+	env.RegisterActivity(CreateBillActivity)
+	env.RegisterActivity(AppendLineItemActivity)
+	env.RegisterActivity(CloseBillActivity)
+
+	env.OnActivity(CreateBillActivity, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(AppendLineItemActivity, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 
 	attempts := 0
-	env.OnActivity(PersistBillActivity, mock.Anything, mock.Anything).Return(func(_ context.Context, _ Bill) error {
+	env.OnActivity(CloseBillActivity, mock.Anything, mock.Anything).Return(func(_ context.Context, _ CloseBillActivityInput) error {
 		attempts++
 		if attempts < 3 {
 			return errors.New("transient db failure")
@@ -232,5 +247,5 @@ func TestBillingWorkflow_ActivityRetried(t *testing.T) {
 
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
-	assert.GreaterOrEqual(t, attempts, 3, "activity should retry until success")
+	assert.GreaterOrEqual(t, attempts, 3, "close activity should retry until success")
 }

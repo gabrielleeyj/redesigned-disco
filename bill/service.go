@@ -46,7 +46,9 @@ func initService() (*Service, error) {
 
 	w := worker.New(c, TaskQueue, worker.Options{})
 	w.RegisterWorkflow(BillingWorkflow)
-	w.RegisterActivity(PersistBillActivity)
+	w.RegisterActivity(CreateBillActivity)
+	w.RegisterActivity(AppendLineItemActivity)
+	w.RegisterActivity(CloseBillActivity)
 
 	err = w.Start()
 	if err != nil {

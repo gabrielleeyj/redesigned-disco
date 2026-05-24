@@ -102,16 +102,20 @@ type LineItem struct {
 	CreatedAt   time.Time       `json:"createdAt"`
 }
 
-// Bill is the aggregate root: an open or closed bill with its line items
-// and running total. The workflow holds this as in-memory state; the
-// activity persists it on close.
+// Bill is the aggregate root: an open or closed bill with its running
+// total. LineItems is populated by the API layer on read (joined from
+// the DB) and is left nil by the workflow's in-memory state. The
+// workflow now persists each item incrementally via
+// AppendLineItemActivity instead of buffering them in memory until
+// close — see docs/architecture.md for the rationale.
 type Bill struct {
 	ID          string          `json:"id"`
 	AccountID   string          `json:"accountId"`
 	Status      BillStatus      `json:"status"`
 	Currency    Currency        `json:"currency"`
-	LineItems   []LineItem      `json:"lineItems"`
+	LineItems   []LineItem      `json:"lineItems,omitempty"`
 	TotalAmount decimal.Decimal `json:"totalAmount"`
+	ItemCount   int             `json:"itemCount"`
 	CreatedAt   time.Time       `json:"createdAt"`
 	ClosedAt    *time.Time      `json:"closedAt,omitempty"`
 	PeriodStart *time.Time      `json:"periodStart,omitempty"`
@@ -120,15 +124,19 @@ type Bill struct {
 }
 
 // BillWorkflowInput is the argument to BillingWorkflow.
+//
+// Snapshot + SeenItemIDs are populated only on ContinueAsNew. They
+// carry the running summary (without line items) and the dedup set
+// across run boundaries so per-run history stays bounded regardless
+// of how many items the bill accumulates.
 type BillWorkflowInput struct {
 	BillID      string     `json:"billId"`
 	AccountID   string     `json:"accountId"`
 	Currency    Currency   `json:"currency"`
 	PeriodStart *time.Time `json:"periodStart,omitempty"`
 	PeriodEnd   *time.Time `json:"periodEnd,omitempty"`
-	// Snapshot carries accumulated bill state across ContinueAsNew boundaries.
-	// Nil for the initial workflow run.
-	Snapshot *Bill `json:"snapshot,omitempty"`
+	Snapshot    *Bill      `json:"snapshot,omitempty"`
+	SeenItemIDs []string   `json:"seenItemIds,omitempty"`
 }
 
 // BillResult is the value returned by BillingWorkflow on completion.

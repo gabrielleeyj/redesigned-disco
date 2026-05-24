@@ -2,8 +2,10 @@ package bill
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"encore.dev/beta/errs"
@@ -128,7 +130,7 @@ func newBillID(accountID, idempotencyKey string) string {
 // caller's intent. If query fails, fall back to the caller's request
 // shape so the response is at least well-formed.
 func (s *Service) createBillReplayResponse(ctx context.Context, billID string, currency Currency, req *CreateBillRequest) (*CreateBillResponse, error) {
-	state, err := s.loadBill(ctx, billID)
+	state, err := s.loadBillSummary(ctx, billID)
 	if err == nil {
 		return &CreateBillResponse{
 			BillID:      state.ID,
@@ -362,12 +364,13 @@ func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse,
 	return s.closeBillFromDB(ctx, id)
 }
 
-// closeBillFromDB builds a CloseBillResponse from the persisted row.
-// Used both on the success path (after the workflow completed) and on
-// the idempotent-retry path (Temporal NotFound → workflow gone but
-// row already present). Maps no-rows to 404; other errors to 500.
+// closeBillFromDB builds a CloseBillResponse from the persisted row
+// plus line items. Used both on the success path (after the workflow
+// completed) and on the idempotent-retry path (Temporal NotFound →
+// workflow gone but row already present). Maps no-rows to 404; other
+// errors to 500.
 func (s *Service) closeBillFromDB(ctx context.Context, id string) (*CloseBillResponse, error) {
-	bill, err := s.getBillFromDB(ctx, id)
+	bill, err := s.getBillRowFromDB(ctx, id)
 	if err != nil {
 		if errors.Is(err, sqldb.ErrNoRows) {
 			return nil, &errs.Error{
@@ -381,13 +384,21 @@ func (s *Service) closeBillFromDB(ctx context.Context, id string) (*CloseBillRes
 			Message: "failed to retrieve closed bill",
 		}
 	}
+	items, ierr := s.fetchLineItems(ctx, id)
+	if ierr != nil {
+		rlog.Error("failed to load line items for close", "bill_id", id, "err", ierr)
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: "failed to retrieve closed bill items",
+		}
+	}
 
 	return &CloseBillResponse{
 		BillID:      bill.ID,
 		Status:      string(bill.Status),
 		TotalAmount: bill.TotalAmount,
 		Currency:    string(bill.Currency),
-		LineItems:   bill.LineItems,
+		LineItems:   items,
 		ClosedAt:    bill.ClosedAt,
 		CloseReason: bill.CloseReason,
 	}, nil
@@ -399,31 +410,47 @@ type GetBillResponse struct {
 
 //encore:api auth method=GET path=/bills/:id
 func (s *Service) GetBill(ctx context.Context, id string) (*GetBillResponse, error) {
-	bill, err := s.loadBill(ctx, id)
+	// Check ownership against the summary before paying for the line
+	// items fetch — saves a DB round-trip for non-owners. Returns
+	// NotFound (not PermissionDenied) so existence does not leak to
+	// non-owners.
+	summary, err := s.loadBillSummary(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	if bill.AccountID != callerAccountID(ctx) {
-		// Return NotFound (not PermissionDenied) so existence does not
-		// leak to non-owners — a tenancy-scoped 404 is the same answer
-		// the caller would get for a typo'd ID.
+	if summary.AccountID != callerAccountID(ctx) {
 		return nil, &errs.Error{
 			Code:    errs.NotFound,
 			Message: fmt.Sprintf("bill %s not found", id),
 		}
 	}
-	return &GetBillResponse{Bill: bill}, nil
+	items, ierr := s.fetchLineItems(ctx, id)
+	if ierr != nil {
+		rlog.Error("line items fetch failed", "bill_id", id, "err", ierr)
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: "failed to load line items",
+		}
+	}
+	summary.LineItems = items
+	return &GetBillResponse{Bill: summary}, nil
 }
 
-// loadBill resolves a bill ID to its current state via Temporal query
-// (open bills) with a DB fallback (closed bills). Returns an
-// errs.Error with the appropriate code; callers should not wrap.
+// loadBillSummary resolves a bill ID to its summary state (no line
+// items) via Temporal query first, DB fallback for closed bills.
+// Returns an errs.Error with the appropriate code; callers should
+// not wrap.
 //
-// Only NotFound from Temporal triggers the DB fallback. A non-NotFound
-// query error (Temporal unavailable, context canceled) must NOT
-// degrade to a DB lookup or an in-flight bill that lives only in
-// workflow memory would report as 404.
-func (s *Service) loadBill(ctx context.Context, id string) (Bill, error) {
+// Only NotFound from Temporal triggers the DB fallback. A
+// non-NotFound query error (Temporal unavailable, context canceled)
+// must NOT degrade to a DB lookup or an in-flight bill that lives
+// only in workflow memory would report as 404.
+//
+// Use loadBill (which calls this then attaches items) when the
+// response needs line items; use loadBillSummary directly for the
+// ownership pre-check on mutating endpoints, which only needs the
+// account ID.
+func (s *Service) loadBillSummary(ctx context.Context, id string) (Bill, error) {
 	workflowID := fmt.Sprintf("bill-%s", id)
 
 	state, err := s.queryBillState(ctx, workflowID)
@@ -440,7 +467,7 @@ func (s *Service) loadBill(ctx context.Context, id string) (Bill, error) {
 		}
 	}
 
-	bill, dberr := s.getBillFromDB(ctx, id)
+	bill, dberr := s.getBillRowFromDB(ctx, id)
 	if dberr != nil {
 		if errors.Is(dberr, sqldb.ErrNoRows) {
 			return Bill{}, &errs.Error{
@@ -457,6 +484,35 @@ func (s *Service) loadBill(ctx context.Context, id string) (Bill, error) {
 	return bill, nil
 }
 
+// fetchLineItems loads every line item for a bill in created-at order.
+// Used by GetBill / CloseBill for the inline list. The paginated
+// ListLineItems endpoint takes a different code path with cursor +
+// limit to bound response size.
+func (s *Service) fetchLineItems(ctx context.Context, billID string) ([]LineItem, error) {
+	rows, err := db.Query(ctx, `
+		SELECT id, description, amount, currency, created_at
+		FROM line_items
+		WHERE bill_id = $1
+		ORDER BY created_at, id`, billID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := []LineItem{}
+	for rows.Next() {
+		var item LineItem
+		if err := rows.Scan(&item.ID, &item.Description, &item.Amount, &item.Currency, &item.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan line item: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate line items: %w", err)
+	}
+	return items, nil
+}
+
 // assertOwnsBill loads the bill and verifies the caller owns it. Used
 // as a pre-check on per-bill mutating endpoints. Returns NotFound
 // (404) for both "bill does not exist" and "bill belongs to another
@@ -467,7 +523,7 @@ func (s *Service) loadBill(ctx context.Context, id string) (Bill, error) {
 // either cache the account_id by bill_id locally or push the check
 // into the workflow validator on AddLineItem.
 func (s *Service) assertOwnsBill(ctx context.Context, id string) error {
-	bill, err := s.loadBill(ctx, id)
+	bill, err := s.loadBillSummary(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -478,6 +534,142 @@ func (s *Service) assertOwnsBill(ctx context.Context, id string) error {
 		}
 	}
 	return nil
+}
+
+type ListLineItemsRequest struct {
+	// Cursor is opaque — pass back the NextCursor from the previous
+	// response. Empty cursor starts from the beginning. Format is
+	// implementation-defined and may change; callers must not parse.
+	Cursor string `query:"cursor"`
+	Limit  int    `query:"limit"`
+}
+
+type ListLineItemsResponse struct {
+	Items      []LineItem `json:"items"`
+	NextCursor string     `json:"nextCursor,omitempty"`
+	Limit      int        `json:"limit"`
+}
+
+//encore:api auth method=GET path=/bills/:id/line-items
+//
+// ListLineItems returns a paginated view of a bill's items in
+// created-at order. Use this instead of the inline LineItems on
+// GetBill / CloseBill for bills that may hold thousands of items —
+// the inline list is unbounded and intended for small bills.
+func (s *Service) ListLineItems(ctx context.Context, id string, req *ListLineItemsRequest) (*ListLineItemsResponse, error) {
+	if err := s.assertOwnsBill(ctx, id); err != nil {
+		return nil, err
+	}
+
+	limit := defaultListLimit
+	if req != nil {
+		if req.Limit < 0 {
+			return nil, &errs.Error{
+				Code:    errs.InvalidArgument,
+				Message: "limit must be non-negative",
+			}
+		}
+		if req.Limit > 0 {
+			limit = req.Limit
+		}
+	}
+	if limit > maxListLimit {
+		limit = maxListLimit
+	}
+
+	cursorTime, cursorID, err := decodeLineItemCursor(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch one extra row so we can tell whether another page exists
+	// without a separate COUNT — if we get limit+1 back, there's more.
+	// First page (no cursor) uses a different predicate to avoid
+	// asking Postgres to compare against an empty UUID literal.
+	var rows *sqldb.Rows
+	if cursorID == "" {
+		rows, err = db.Query(ctx, `
+			SELECT id, description, amount, currency, created_at
+			FROM line_items
+			WHERE bill_id = $1
+			ORDER BY created_at, id
+			LIMIT $2`, id, limit+1)
+	} else {
+		rows, err = db.Query(ctx, `
+			SELECT id, description, amount, currency, created_at
+			FROM line_items
+			WHERE bill_id = $1
+			  AND (created_at, id) > ($2, $3)
+			ORDER BY created_at, id
+			LIMIT $4`, id, cursorTime, cursorID, limit+1)
+	}
+	if err != nil {
+		rlog.Error("list line items query failed", "bill_id", id, "err", err)
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: "failed to list line items",
+		}
+	}
+	defer rows.Close()
+
+	items := []LineItem{}
+	for rows.Next() {
+		var item LineItem
+		if err := rows.Scan(&item.ID, &item.Description, &item.Amount, &item.Currency, &item.CreatedAt); err != nil {
+			return nil, &errs.Error{
+				Code:    errs.Internal,
+				Message: "failed to scan line item",
+			}
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: fmt.Sprintf("iterating line items: %v", err),
+		}
+	}
+
+	var nextCursor string
+	if len(items) > limit {
+		last := items[limit-1]
+		nextCursor = encodeLineItemCursor(last.CreatedAt, last.ID)
+		items = items[:limit]
+	}
+
+	return &ListLineItemsResponse{
+		Items:      items,
+		NextCursor: nextCursor,
+		Limit:      limit,
+	}, nil
+}
+
+// decodeLineItemCursor splits a base64-encoded `<rfc3339>|<uuid>`
+// cursor into its components. Empty cursor returns zero values which
+// the WHERE predicate treats as "start from the beginning". A
+// malformed cursor is an InvalidArgument — callers should not be
+// crafting cursors by hand.
+func decodeLineItemCursor(req *ListLineItemsRequest) (time.Time, string, error) {
+	if req == nil || req.Cursor == "" {
+		return time.Time{}, "", nil
+	}
+	raw, err := base64.URLEncoding.DecodeString(req.Cursor)
+	if err != nil {
+		return time.Time{}, "", &errs.Error{Code: errs.InvalidArgument, Message: "invalid cursor"}
+	}
+	parts := strings.SplitN(string(raw), "|", 2)
+	if len(parts) != 2 {
+		return time.Time{}, "", &errs.Error{Code: errs.InvalidArgument, Message: "invalid cursor"}
+	}
+	ts, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return time.Time{}, "", &errs.Error{Code: errs.InvalidArgument, Message: "invalid cursor"}
+	}
+	return ts, parts[1], nil
+}
+
+func encodeLineItemCursor(ts time.Time, id string) string {
+	return base64.URLEncoding.EncodeToString([]byte(ts.Format(time.RFC3339Nano) + "|" + id))
 }
 
 type ListBillsRequest struct {
@@ -589,35 +781,13 @@ func (s *Service) queryBillState(ctx context.Context, workflowID string) (Bill, 
 	return bill, err
 }
 
-func (s *Service) getBillFromDB(ctx context.Context, id string) (Bill, error) {
+// getBillRowFromDB returns only the bills-table fields (no line
+// items). Used by the loadBillSummary path and the close idempotency
+// path. Callers that need items should join via fetchLineItems.
+func (s *Service) getBillRowFromDB(ctx context.Context, id string) (Bill, error) {
 	row := db.QueryRow(ctx, `
 		SELECT id, account_id, status, currency, total_amount, created_at, closed_at,
 		       period_start, period_end, close_reason
 		FROM bills WHERE id = $1`, id)
-	b, err := scanBillRow(row)
-	if err != nil {
-		return Bill{}, err
-	}
-
-	rows, err := db.Query(ctx, `
-		SELECT id, description, amount, currency, created_at
-		FROM line_items WHERE bill_id = $1 ORDER BY created_at`, id)
-	if err != nil {
-		return Bill{}, err
-	}
-	defer rows.Close()
-
-	b.LineItems = []LineItem{}
-	for rows.Next() {
-		var item LineItem
-		if err := rows.Scan(&item.ID, &item.Description, &item.Amount, &item.Currency, &item.CreatedAt); err != nil {
-			return Bill{}, fmt.Errorf("scan line item: %w", err)
-		}
-		b.LineItems = append(b.LineItems, item)
-	}
-	if err := rows.Err(); err != nil {
-		return Bill{}, fmt.Errorf("iterating line items: %w", err)
-	}
-
-	return b, nil
+	return scanBillRow(row)
 }

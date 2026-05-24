@@ -2,6 +2,7 @@ package bill
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -412,21 +413,30 @@ func TestGetBill_FromWorkflow(t *testing.T) {
 	withTestAuth(t)
 	svc, mockClient := newTestService(t)
 
-	qr := &mockQueryResult{}
+	billID := uuid.NewString()
+	qr := &mockQueryResult{
+		fill: &Bill{
+			ID:        billID,
+			AccountID: testAccountID,
+			Status:    BillStatusOpen,
+			Currency:  CurrencyUSD,
+		},
+	}
 	qr.On("Get", mock.AnythingOfType("*bill.Bill")).Return(nil)
 
 	mockClient.On("QueryWorkflow",
 		mock.Anything,
-		"bill-existing",
+		"bill-"+billID,
 		"",
 		QueryBillState,
 	).Return(qr, nil)
 
-	resp, err := svc.GetBill(context.Background(), "existing")
+	resp, err := svc.GetBill(context.Background(), billID)
 
 	require.NoError(t, err)
-	assert.Equal(t, "test-id", resp.Bill.ID)
+	assert.Equal(t, billID, resp.Bill.ID)
 	assert.Equal(t, BillStatusOpen, resp.Bill.Status)
+	assert.Empty(t, resp.Bill.LineItems, "no items inserted, fetch should return empty")
 }
 
 func TestGetBill_QueryUnavailable(t *testing.T) {
@@ -454,9 +464,10 @@ func TestGetBill_OwnershipMismatchReturns404(t *testing.T) {
 	withTestAuth(t)
 	svc, mockClient := newTestService(t)
 
+	billID := uuid.NewString()
 	qr := &mockQueryResult{
 		fill: &Bill{
-			ID:        "test-id",
+			ID:        billID,
 			AccountID: "other-account",
 			Status:    BillStatusOpen,
 			Currency:  CurrencyUSD,
@@ -466,16 +477,105 @@ func TestGetBill_OwnershipMismatchReturns404(t *testing.T) {
 
 	mockClient.On("QueryWorkflow",
 		mock.Anything,
-		"bill-existing",
+		"bill-"+billID,
 		"",
 		QueryBillState,
 	).Return(qr, nil)
 
-	_, err := svc.GetBill(context.Background(), "existing")
+	_, err := svc.GetBill(context.Background(), billID)
 	require.Error(t, err)
 	var e *errs.Error
 	require.ErrorAs(t, err, &e)
 	assert.Equal(t, errs.NotFound, e.Code)
+}
+
+func TestListLineItems_PagesThroughCursor(t *testing.T) {
+	// Insert N items, page through with limit=2, verify ordering and
+	// that the cursor consumes the whole set with no duplicates or
+	// gaps. Uses the real DB so the keyset predicate is exercised.
+	withTestAuth(t)
+	svc, mockClient := newTestService(t)
+
+	billID := uuid.NewString()
+	_, err := db.Exec(context.Background(), `
+		INSERT INTO bills (id, account_id, status, currency, total_amount, created_at)
+		VALUES ($1, $2, 'OPEN', 'USD', 0, NOW())`,
+		billID, testAccountID,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DELETE FROM line_items WHERE bill_id = $1`, billID)
+		_, _ = db.Exec(context.Background(), `DELETE FROM bills WHERE id = $1`, billID)
+	})
+
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	for i := 0; i < 5; i++ {
+		_, err := db.Exec(context.Background(), `
+			INSERT INTO line_items (id, bill_id, description, amount, currency, created_at)
+			VALUES ($1, $2, $3, 1, 'USD', $4)`,
+			uuid.NewString(), billID, fmt.Sprintf("item-%d", i), base.Add(time.Duration(i)*time.Second),
+		)
+		require.NoError(t, err)
+	}
+
+	// Stub the ownership pre-check: workflow query says NotFound so
+	// the path falls through to the DB-backed bill row (real).
+	mockClient.On("QueryWorkflow",
+		mock.Anything,
+		"bill-"+billID,
+		"",
+		QueryBillState,
+	).Return((*mockQueryResult)(nil), &serviceerror.NotFound{Message: "completed"})
+
+	collected := []string{}
+	cursor := ""
+	for {
+		resp, err := svc.ListLineItems(context.Background(), billID, &ListLineItemsRequest{
+			Cursor: cursor,
+			Limit:  2,
+		})
+		require.NoError(t, err)
+		for _, item := range resp.Items {
+			collected = append(collected, item.Description)
+		}
+		if resp.NextCursor == "" {
+			break
+		}
+		cursor = resp.NextCursor
+	}
+
+	assert.Equal(t, []string{"item-0", "item-1", "item-2", "item-3", "item-4"}, collected)
+}
+
+func TestListLineItems_RejectsMalformedCursor(t *testing.T) {
+	withTestAuth(t)
+	svc, mockClient := newTestService(t)
+	billID := uuid.NewString()
+
+	_, err := db.Exec(context.Background(), `
+		INSERT INTO bills (id, account_id, status, currency, total_amount, created_at)
+		VALUES ($1, $2, 'OPEN', 'USD', 0, NOW())`,
+		billID, testAccountID,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DELETE FROM bills WHERE id = $1`, billID)
+	})
+
+	mockClient.On("QueryWorkflow",
+		mock.Anything,
+		"bill-"+billID,
+		"",
+		QueryBillState,
+	).Return((*mockQueryResult)(nil), &serviceerror.NotFound{Message: "completed"})
+
+	_, err = svc.ListLineItems(context.Background(), billID, &ListLineItemsRequest{
+		Cursor: "not-base64!!!",
+	})
+	require.Error(t, err)
+	var e *errs.Error
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.InvalidArgument, e.Code)
 }
 
 func TestAuthHandler_RejectsMissingHeader(t *testing.T) {
