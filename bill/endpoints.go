@@ -211,14 +211,23 @@ func mapTemporalRPCError(err error, op string) *errs.Error {
 }
 
 // classifyUpdateError maps the outcome of a Temporal update handle's Get
-// onto Encore error codes. Validator rejections surface as ApplicationError
-// (-> InvalidArgument). Timeouts and canceled-by-server surface as
+// onto Encore error codes. Validator rejections surface as
+// ApplicationError; the error Type distinguishes a state conflict (the
+// bill's locked-in currency does not match the item — 409
+// FailedPrecondition) from a bad payload (everything else — 400
+// InvalidArgument). Timeouts and canceled-by-server surface as
 // DeadlineExceeded. Everything else is treated as Internal and logged so
 // infrastructure failures are not silently presented to callers as
 // validation errors.
 func classifyUpdateError(err error) *errs.Error {
 	var appErr *temporal.ApplicationError
 	if errors.As(err, &appErr) {
+		if appErr.Type() == currencyMismatchErrType {
+			return &errs.Error{
+				Code:    errs.FailedPrecondition,
+				Message: appErr.Message(),
+			}
+		}
 		return &errs.Error{
 			Code:    errs.InvalidArgument,
 			Message: appErr.Message(),

@@ -14,6 +14,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/mocks"
+	"go.temporal.io/sdk/temporal"
 )
 
 type mockQueryResult struct {
@@ -133,6 +134,29 @@ func TestAddLineItem_ClosedBill(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not found or already closed")
+}
+
+func TestClassifyUpdateError_CurrencyMismatchIsFailedPrecondition(t *testing.T) {
+	// The workflow validator returns ApplicationError with type
+	// CurrencyMismatch when an item's currency does not match the bill's
+	// locked-in currency. That is a state conflict, not a bad request —
+	// the endpoint must surface it as FailedPrecondition (409) so
+	// callers can distinguish "fix the payload" from "fix the routing".
+	mismatchErr := temporal.NewApplicationError(
+		"currency mismatch: bill is USD, item is GEL",
+		currencyMismatchErrType,
+	)
+	e := classifyUpdateError(mismatchErr)
+	require.NotNil(t, e)
+	assert.Equal(t, errs.FailedPrecondition, e.Code)
+	assert.Contains(t, e.Message, "currency mismatch")
+}
+
+func TestClassifyUpdateError_OtherAppErrorIsInvalidArgument(t *testing.T) {
+	other := temporal.NewApplicationError("amount must be positive", "ValidationError")
+	e := classifyUpdateError(other)
+	require.NotNil(t, e)
+	assert.Equal(t, errs.InvalidArgument, e.Code)
 }
 
 func TestAddLineItem_TemporalUnavailable(t *testing.T) {
