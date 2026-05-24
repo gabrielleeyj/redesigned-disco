@@ -67,35 +67,43 @@ func BillingWorkflow(ctx workflow.Context, input BillWorkflowInput) (BillResult,
 	closeCh := workflow.GetSignalChannel(ctx, SignalCloseBill)
 
 	closed := false
-	for !closed {
-		selector := workflow.NewSelector(ctx)
+	workflow.Go(ctx, func(ctx workflow.Context) {
+		var signal CloseBillSignal
+		closeCh.Receive(ctx, &signal)
+		closed = true
+	})
 
-		selector.AddReceive(closeCh, func(c workflow.ReceiveChannel, more bool) {
-			var signal CloseBillSignal
-			c.Receive(ctx, &signal)
-			closed = true
-		})
-
-		selector.Select(ctx)
-
-		if len(bill.LineItems) >= continueAsNewThreshold && !closed {
-			// Deep-copy LineItems so the new workflow run owns an independent
-			// backing array. A shallow struct copy aliases the slice, and any
-			// future append in the continued run could write into our snapshot.
-			snapshot := bill
-			snapshot.LineItems = append([]LineItem(nil), bill.LineItems...)
-			return BillResult{}, workflow.NewContinueAsNewError(ctx, BillingWorkflow, BillWorkflowInput{
-				BillID:   input.BillID,
-				Currency: input.Currency,
-				Snapshot: &snapshot,
-			})
-		}
+	// Wake on either a close signal OR the line-item threshold so a long
+	// stream of updates can trigger continue-as-new without waiting for a
+	// close. Update handlers run on independent coroutines, so a plain
+	// selector waiting on the close channel would never observe item
+	// growth between selects.
+	if err := workflow.Await(ctx, func() bool {
+		return closed || len(bill.LineItems) >= continueAsNewThreshold
+	}); err != nil {
+		return BillResult{}, fmt.Errorf("await close or threshold: %w", err)
 	}
 
+	// Drain any updates accepted before we decided to close or roll over.
+	// AllHandlersFinished ensures their state mutations land in `bill`
+	// before we snapshot or persist.
 	if err := workflow.Await(ctx, func() bool {
 		return workflow.AllHandlersFinished(ctx)
 	}); err != nil {
 		return BillResult{}, fmt.Errorf("await pending updates: %w", err)
+	}
+
+	if !closed {
+		// Deep-copy LineItems so the new workflow run owns an independent
+		// backing array. A shallow struct copy aliases the slice, and any
+		// future append in the continued run could write into our snapshot.
+		snapshot := bill
+		snapshot.LineItems = append([]LineItem(nil), bill.LineItems...)
+		return BillResult{}, workflow.NewContinueAsNewError(ctx, BillingWorkflow, BillWorkflowInput{
+			BillID:   input.BillID,
+			Currency: input.Currency,
+			Snapshot: &snapshot,
+		})
 	}
 
 	now := workflow.Now(ctx)

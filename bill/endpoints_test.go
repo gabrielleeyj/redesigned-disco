@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/mocks"
 )
@@ -119,7 +120,7 @@ func TestAddLineItem_ClosedBill(t *testing.T) {
 	mockClient.On("UpdateWorkflow",
 		mock.Anything,
 		mock.AnythingOfType("internal.UpdateWorkflowOptions"),
-	).Return((*mocks.WorkflowUpdateHandle)(nil), assert.AnError)
+	).Return((*mocks.WorkflowUpdateHandle)(nil), &serviceerror.NotFound{Message: "workflow not found"})
 
 	_, err := svc.AddLineItem(context.Background(), "closed-bill", &AddLineItemRequest{
 		Description: "Fee",
@@ -128,7 +129,46 @@ func TestAddLineItem_ClosedBill(t *testing.T) {
 	})
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "cannot add item")
+	assert.Contains(t, err.Error(), "not found or already closed")
+}
+
+func TestAddLineItem_TemporalUnavailable(t *testing.T) {
+	svc, mockClient := newTestService(t)
+
+	mockClient.On("UpdateWorkflow",
+		mock.Anything,
+		mock.AnythingOfType("internal.UpdateWorkflowOptions"),
+	).Return((*mocks.WorkflowUpdateHandle)(nil), assert.AnError)
+
+	_, err := svc.AddLineItem(context.Background(), "some-bill", &AddLineItemRequest{
+		Description: "Fee",
+		Amount:      decimal.NewFromInt(10),
+		Currency:    "USD",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "service unavailable")
+}
+
+func TestAddLineItem_ContextCanceled(t *testing.T) {
+	svc, mockClient := newTestService(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	mockClient.On("UpdateWorkflow",
+		mock.Anything,
+		mock.AnythingOfType("internal.UpdateWorkflowOptions"),
+	).Return((*mocks.WorkflowUpdateHandle)(nil), context.Canceled)
+
+	_, err := svc.AddLineItem(ctx, "some-bill", &AddLineItemRequest{
+		Description: "Fee",
+		Amount:      decimal.NewFromInt(10),
+		Currency:    "USD",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "canceled")
 }
 
 func TestCloseBill_WorkflowNotFound(t *testing.T) {
@@ -140,12 +180,12 @@ func TestCloseBill_WorkflowNotFound(t *testing.T) {
 		"",
 		SignalCloseBill,
 		mock.Anything,
-	).Return(assert.AnError)
+	).Return(&serviceerror.NotFound{Message: "workflow not found"})
 
 	_, err := svc.CloseBill(context.Background(), "nonexistent")
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "cannot close bill")
+	assert.Contains(t, err.Error(), "not found or already closed")
 }
 
 func TestGetBill_FromWorkflow(t *testing.T) {
@@ -168,20 +208,24 @@ func TestGetBill_FromWorkflow(t *testing.T) {
 	assert.Equal(t, BillStatusOpen, resp.Bill.Status)
 }
 
-func TestGetBill_NotFound(t *testing.T) {
+func TestGetBill_QueryUnavailable(t *testing.T) {
+	// A non-NotFound query error (e.g. Temporal briefly unavailable or
+	// context canceled) must NOT degrade to a DB lookup, otherwise an open
+	// bill that lives only in workflow memory gets reported as 404.
 	svc, mockClient := newTestService(t)
 
 	mockClient.On("QueryWorkflow",
 		mock.Anything,
-		"bill-nonexistent",
+		"bill-flaky",
 		"",
 		QueryBillState,
 	).Return((*mockQueryResult)(nil), assert.AnError)
 
-	_, err := svc.GetBill(context.Background(), "nonexistent")
+	_, err := svc.GetBill(context.Background(), "flaky")
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not found")
+	assert.Contains(t, err.Error(), "failed to query bill")
+	assert.NotContains(t, err.Error(), "not found")
 }
 
 func TestMoney_DisplayAmount(t *testing.T) {

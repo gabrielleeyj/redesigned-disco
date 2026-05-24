@@ -148,17 +148,35 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 	}, nil
 }
 
+// mapTemporalRPCError classifies an error returned by submitting a signal
+// or update to Temporal. Only NotFound and "workflow already completed"
+// indicate the bill is gone or closed — every other Temporal RPC failure
+// is an infrastructure error and must not be reported to callers as a
+// business-state error, or they may stop retrying on a transient outage.
 func mapTemporalRPCError(err error, op string) *errs.Error {
 	var notFound *serviceerror.NotFound
 	if errors.As(err, &notFound) {
 		return &errs.Error{
 			Code:    errs.NotFound,
-			Message: fmt.Sprintf("cannot %s: bill not found", op),
+			Message: fmt.Sprintf("cannot %s: bill not found or already closed", op),
 		}
 	}
+	if errors.Is(err, context.Canceled) {
+		return &errs.Error{
+			Code:    errs.Canceled,
+			Message: fmt.Sprintf("cannot %s: request canceled", op),
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &errs.Error{
+			Code:    errs.DeadlineExceeded,
+			Message: fmt.Sprintf("cannot %s: deadline exceeded", op),
+		}
+	}
+	rlog.Error("temporal rpc failed", "op", op, "err", err)
 	return &errs.Error{
-		Code:    errs.FailedPrecondition,
-		Message: fmt.Sprintf("cannot %s: bill is closed or not found", op),
+		Code:    errs.Unavailable,
+		Message: fmt.Sprintf("cannot %s: service unavailable", op),
 	}
 }
 
@@ -259,11 +277,20 @@ func (s *Service) GetBill(ctx context.Context, id string) (*GetBillResponse, err
 	if err == nil {
 		return &GetBillResponse{Bill: state}, nil
 	}
-	// Workflow query failed — likely the workflow has completed and history
-	// has been GC'd, in which case the DB read below is authoritative. We
-	// log so a transient infra error (cancelled context, network blip) does
-	// not silently degrade to a DB read without a trace.
-	rlog.Debug("bill workflow query failed, falling back to DB", "bill_id", id, "err", err)
+
+	// Only fall back to the DB when Temporal tells us the workflow is gone
+	// (NotFound). Open bills exist only in workflow memory until CloseBill
+	// persists them — if the query failed for any other reason (Temporal
+	// unavailable, context canceled, network blip) we'd report a false 404
+	// for a live bill. Surface those as Unavailable instead.
+	var notFound *serviceerror.NotFound
+	if !errors.As(err, &notFound) {
+		rlog.Error("bill workflow query failed", "bill_id", id, "err", err)
+		return nil, &errs.Error{
+			Code:    errs.Unavailable,
+			Message: "failed to query bill",
+		}
+	}
 
 	bill, err := s.getBillFromDB(ctx, id)
 	if err != nil {
