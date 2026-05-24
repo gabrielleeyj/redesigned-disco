@@ -78,6 +78,19 @@ func setCurrencies(m map[Currency]CurrencyMeta) {
 	currencyCache.Add(currenciesCacheKey, m)
 }
 
+// refreshCurrencies reloads the registry from the DB and overwrites
+// the cache. Returns the loaded entry count for telemetry. Used by
+// the admin refresh endpoint to pick up newly inserted currencies
+// without waiting for the TTL.
+func refreshCurrencies(ctx context.Context) (int, error) {
+	m, err := loadCurrenciesFromDB(ctx)
+	if err != nil {
+		return 0, err
+	}
+	setCurrencies(m)
+	return len(m), nil
+}
+
 //nolint:unused // called by initService and via cache miss in getCurrencies
 func loadCurrenciesFromDB(ctx context.Context) (map[Currency]CurrencyMeta, error) {
 	rows, err := db.Query(ctx, `

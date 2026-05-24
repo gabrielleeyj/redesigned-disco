@@ -750,6 +750,23 @@ func TestAppendLineItemActivity_DuplicateIsIdempotent(t *testing.T) {
 	assert.True(t, decimal.NewFromInt(10).Equal(total), "total must not double-count")
 }
 
+func TestRefreshCurrencies_RebuildsCacheFromDB(t *testing.T) {
+	// Wipe the cache then call the endpoint. The reload pulls from
+	// the seeded migration; the response count should match what we
+	// inserted in migration 2_currencies.up.sql.
+	withTestAuth(t)
+	svc, _ := newTestService(t)
+
+	// Override with an empty map to prove the refresh actually
+	// repopulates rather than reading a stale value.
+	setCurrencies(map[Currency]CurrencyMeta{})
+
+	resp, err := svc.RefreshCurrencies(context.Background())
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, resp.CurrencyCount, 4, "expected at least USD/EUR/GBP/GEL from seed")
+	assert.True(t, Currency("USD").Valid(), "registry should know USD again after refresh")
+}
+
 func TestAuthHandler_RejectsMissingHeader(t *testing.T) {
 	_, _, err := AuthHandler(context.Background(), &AuthParams{AccountID: ""})
 	require.Error(t, err)
