@@ -100,6 +100,81 @@ func TestCreateBill_Success(t *testing.T) {
 	assert.NotEmpty(t, resp.BillID)
 }
 
+func TestNewBillID_DeterministicForSameAccountAndKey(t *testing.T) {
+	a := newBillID("acct-1", "key-A")
+	b := newBillID("acct-1", "key-A")
+	assert.Equal(t, a, b)
+}
+
+func TestNewBillID_DifferentForDifferentAccounts(t *testing.T) {
+	a := newBillID("acct-1", "key-A")
+	b := newBillID("acct-2", "key-A")
+	assert.NotEqual(t, a, b, "same key under different accounts must produce different bill IDs")
+}
+
+func TestNewBillID_RandomWhenNoKey(t *testing.T) {
+	a := newBillID("acct-1", "")
+	b := newBillID("acct-1", "")
+	assert.NotEqual(t, a, b, "missing key should yield fresh UUIDs each call")
+}
+
+func TestCreateBill_IdempotentRetryReturnsSameBillID(t *testing.T) {
+	// Same (account, idempotency key) → same workflow ID. Temporal
+	// returns WorkflowExecutionAlreadyStarted on the retry; endpoint
+	// surfaces the existing bill instead of failing with AlreadyExists.
+	withTestAuth(t)
+	svc, mockClient := newTestService(t)
+
+	mockRun := &mocks.WorkflowRun{}
+	mockRun.On("GetID").Return("bill-some-uuid")
+	mockRun.On("GetRunID").Return("run-1")
+
+	// First attempt succeeds.
+	mockClient.On("ExecuteWorkflow",
+		mock.Anything,
+		mock.AnythingOfType("internal.StartWorkflowOptions"),
+		mock.AnythingOfType("func(internal.Context, bill.BillWorkflowInput) (bill.BillResult, error)"),
+		mock.AnythingOfType("bill.BillWorkflowInput"),
+	).Return(mockRun, nil).Once()
+
+	// Second attempt with the same key → already-started.
+	mockClient.On("ExecuteWorkflow",
+		mock.Anything,
+		mock.AnythingOfType("internal.StartWorkflowOptions"),
+		mock.AnythingOfType("func(internal.Context, bill.BillWorkflowInput) (bill.BillResult, error)"),
+		mock.AnythingOfType("bill.BillWorkflowInput"),
+	).Return((*mocks.WorkflowRun)(nil), &serviceerror.WorkflowExecutionAlreadyStarted{Message: "exists"}).Once()
+
+	// On retry, loadBill is consulted to surface authoritative state.
+	// Return a workflow query result with matching account.
+	expectedID := newBillID(testAccountID, "create-key-1")
+	qr := &mockQueryResult{
+		fill: &Bill{
+			ID:        expectedID,
+			AccountID: testAccountID,
+			Status:    BillStatusOpen,
+			Currency:  CurrencyUSD,
+		},
+	}
+	qr.On("Get", mock.AnythingOfType("*bill.Bill")).Return(nil)
+	mockClient.On("QueryWorkflow",
+		mock.Anything,
+		"bill-"+expectedID,
+		"",
+		QueryBillState,
+	).Return(qr, nil)
+
+	req := &CreateBillRequest{Currency: "USD", IdempotencyKey: "create-key-1"}
+
+	first, err := svc.CreateBill(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, expectedID, first.BillID)
+
+	second, err := svc.CreateBill(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, first.BillID, second.BillID, "idempotent retry must return the same bill")
+}
+
 func TestAddLineItem_InvalidInput(t *testing.T) {
 	tests := []struct {
 		name    string
