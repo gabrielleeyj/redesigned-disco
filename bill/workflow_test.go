@@ -1,6 +1,7 @@
 package bill
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -134,7 +135,7 @@ func TestBillingWorkflow_ActivityRetried(t *testing.T) {
 	env.RegisterActivity(PersistBillActivity)
 
 	attempts := 0
-	env.OnActivity(PersistBillActivity, mock.Anything, mock.Anything).Return(func(_ interface{}, _ Bill) error {
+	env.OnActivity(PersistBillActivity, mock.Anything, mock.Anything).Return(func(_ context.Context, _ Bill) error {
 		attempts++
 		if attempts < 3 {
 			return errors.New("transient db failure")
