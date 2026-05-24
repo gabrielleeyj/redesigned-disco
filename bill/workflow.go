@@ -173,7 +173,12 @@ func registerAddLineItemHandler(ctx workflow.Context, bill *Bill, seen map[strin
 			// set is NOT advanced, so the retry will reattempt the
 			// insert (idempotent via ON CONFLICT).
 			actCtx := workflow.WithActivityOptions(ctx, shortActivityOpts())
-			if err := workflow.ExecuteActivity(actCtx, AppendLineItemActivity, item, bill.ID).Get(ctx, nil); err != nil {
+			actInput := AppendLineItemInput{
+				BillID: bill.ID,
+				Actor:  in.CallerAccountID,
+				Item:   item,
+			}
+			if err := workflow.ExecuteActivity(actCtx, AppendLineItemActivity, actInput).Get(ctx, nil); err != nil {
 				return AddLineItemResult{}, fmt.Errorf("persist line item: %w", err)
 			}
 
@@ -251,9 +256,20 @@ func finalizeAndPersist(ctx workflow.Context, bill *Bill, reason CloseReason) (B
 	bill.ClosedAt = &now
 	bill.CloseReason = reason
 
+	// Period-end close has no human caller; record SystemActor so the
+	// audit trail distinguishes manual close from auto-close. Signal
+	// close is attributed to the bill's owning account because we
+	// already verified ownership before sending the signal (see
+	// CloseBill endpoint).
+	actor := SystemActor
+	if reason == CloseReasonSignal {
+		actor = bill.AccountID
+	}
+
 	actCtx := workflow.WithActivityOptions(ctx, shortActivityOpts())
 	err := workflow.ExecuteActivity(actCtx, CloseBillActivity, CloseBillActivityInput{
 		BillID:      bill.ID,
+		Actor:       actor,
 		TotalAmount: bill.TotalAmount,
 		ClosedAt:    now,
 		CloseReason: reason,

@@ -35,7 +35,7 @@ func registerAndStubActivities(env *testsuite.TestWorkflowEnvironment) {
 	env.RegisterActivity(AppendLineItemActivity)
 	env.RegisterActivity(CloseBillActivity)
 	env.OnActivity(CreateBillActivity, mock.Anything, mock.Anything).Return(nil)
-	env.OnActivity(AppendLineItemActivity, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(AppendLineItemActivity, mock.Anything, mock.Anything).Return(nil)
 	env.OnActivity(CloseBillActivity, mock.Anything, mock.Anything).Return(nil)
 }
 
@@ -228,7 +228,7 @@ func TestBillingWorkflow_CloseActivityRetried(t *testing.T) {
 	env.RegisterActivity(CloseBillActivity)
 
 	env.OnActivity(CreateBillActivity, mock.Anything, mock.Anything).Return(nil)
-	env.OnActivity(AppendLineItemActivity, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(AppendLineItemActivity, mock.Anything, mock.Anything).Return(nil)
 
 	attempts := 0
 	env.OnActivity(CloseBillActivity, mock.Anything, mock.Anything).Return(func(_ context.Context, _ CloseBillActivityInput) error {

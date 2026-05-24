@@ -1,6 +1,7 @@
 package bill
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -70,6 +71,32 @@ const (
 	// fired and finalised the bill automatically.
 	CloseReasonPeriodEnd CloseReason = "PERIOD_END"
 )
+
+// BillEventKind tags an entry in the bill_events audit log.
+type BillEventKind string
+
+const (
+	BillEventOpened    BillEventKind = "OPENED"
+	BillEventItemAdded BillEventKind = "ITEM_ADDED"
+	BillEventClosed    BillEventKind = "CLOSED"
+)
+
+// SystemActor is the actor recorded on events that have no human
+// caller — currently only the period-end auto-close fired by the
+// workflow timer.
+const SystemActor = "system"
+
+// BillEvent is one row from bill_events. The table is append-only at
+// the DB layer (triggers block UPDATE/DELETE); the API surface only
+// supports reads.
+type BillEvent struct {
+	ID        string          `json:"id"`
+	BillID    string          `json:"billId"`
+	Kind      BillEventKind   `json:"kind"`
+	Actor     string          `json:"actor"`
+	Payload   json.RawMessage `json:"payload"`
+	CreatedAt time.Time       `json:"createdAt"`
+}
 
 // Money carries an arbitrary-precision decimal amount tagged with a currency.
 // Persistence and arithmetic preserve full precision; rounding is applied at

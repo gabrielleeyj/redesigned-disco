@@ -652,6 +652,104 @@ func TestListBills_RejectsInvalidStatus(t *testing.T) {
 	assert.Equal(t, errs.InvalidArgument, e.Code)
 }
 
+func TestBillEvents_AppendOnlyAndOrderedByActivities(t *testing.T) {
+	// Drive the three activities directly against the real DB to
+	// verify each writes its event, the append-only trigger holds,
+	// and ListBillEvents returns them in order. Activities are the
+	// only producers; the endpoint only reads.
+	withTestAuth(t)
+	svc, mockClient := newTestService(t)
+
+	bill := Bill{
+		ID:        uuid.NewString(),
+		AccountID: testAccountID,
+		Status:    BillStatusOpen,
+		Currency:  CurrencyUSD,
+		CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DELETE FROM bill_events WHERE bill_id = $1`, bill.ID)
+		_, _ = db.Exec(context.Background(), `DELETE FROM line_items WHERE bill_id = $1`, bill.ID)
+		_, _ = db.Exec(context.Background(), `DELETE FROM bills WHERE id = $1`, bill.ID)
+	})
+
+	require.NoError(t, CreateBillActivity(context.Background(), bill))
+
+	item := LineItem{
+		ID: uuid.NewString(), Description: "fee", Amount: decimal.NewFromInt(10),
+		Currency: CurrencyUSD, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+	}
+	require.NoError(t, AppendLineItemActivity(context.Background(), AppendLineItemInput{
+		BillID: bill.ID, Actor: testAccountID, Item: item,
+	}))
+
+	require.NoError(t, CloseBillActivity(context.Background(), CloseBillActivityInput{
+		BillID: bill.ID, Actor: testAccountID, TotalAmount: decimal.NewFromInt(10),
+		ClosedAt: time.Now().UTC().Truncate(time.Microsecond), CloseReason: CloseReasonSignal,
+	}))
+
+	// Read events back via the endpoint. assertOwnsBill falls back to
+	// DB after a Temporal NotFound (workflow never existed).
+	mockClient.On("QueryWorkflow",
+		mock.Anything,
+		"bill-"+bill.ID,
+		"",
+		QueryBillState,
+	).Return((*mockQueryResult)(nil), &serviceerror.NotFound{Message: "no workflow"})
+
+	resp, err := svc.ListBillEvents(context.Background(), bill.ID, &ListBillEventsRequest{Limit: 50})
+	require.NoError(t, err)
+	require.Len(t, resp.Events, 3, "expected OPENED + ITEM_ADDED + CLOSED")
+	assert.Equal(t, BillEventOpened, resp.Events[0].Kind)
+	assert.Equal(t, BillEventItemAdded, resp.Events[1].Kind)
+	assert.Equal(t, BillEventClosed, resp.Events[2].Kind)
+	assert.Equal(t, testAccountID, resp.Events[0].Actor)
+
+	// Append-only trigger: UPDATE and DELETE must be blocked.
+	_, err = db.Exec(context.Background(), `UPDATE bill_events SET actor = 'tamper' WHERE bill_id = $1`, bill.ID)
+	require.Error(t, err, "UPDATE on bill_events must be blocked by trigger")
+	_, err = db.Exec(context.Background(), `DELETE FROM bill_events WHERE bill_id = $1`, bill.ID)
+	require.Error(t, err, "DELETE on bill_events must be blocked by trigger")
+}
+
+func TestAppendLineItemActivity_DuplicateIsIdempotent(t *testing.T) {
+	// Run twice with the same item; assert single line_item row,
+	// single ITEM_ADDED event, and bills.total_amount = item.Amount
+	// (not 2x).
+	bill := Bill{
+		ID: uuid.NewString(), AccountID: testAccountID, Status: BillStatusOpen,
+		Currency: CurrencyUSD, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DELETE FROM bill_events WHERE bill_id = $1`, bill.ID)
+		_, _ = db.Exec(context.Background(), `DELETE FROM line_items WHERE bill_id = $1`, bill.ID)
+		_, _ = db.Exec(context.Background(), `DELETE FROM bills WHERE id = $1`, bill.ID)
+	})
+	require.NoError(t, CreateBillActivity(context.Background(), bill))
+
+	item := LineItem{
+		ID: uuid.NewString(), Description: "fee", Amount: decimal.NewFromInt(10),
+		Currency: CurrencyUSD, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+	}
+	in := AppendLineItemInput{BillID: bill.ID, Actor: testAccountID, Item: item}
+	require.NoError(t, AppendLineItemActivity(context.Background(), in))
+	require.NoError(t, AppendLineItemActivity(context.Background(), in))
+
+	var itemCount, eventCount int
+	require.NoError(t, db.QueryRow(context.Background(),
+		`SELECT count(*) FROM line_items WHERE bill_id = $1`, bill.ID).Scan(&itemCount))
+	require.NoError(t, db.QueryRow(context.Background(),
+		`SELECT count(*) FROM bill_events WHERE bill_id = $1 AND kind = 'ITEM_ADDED'`, bill.ID).Scan(&eventCount))
+
+	var total decimal.Decimal
+	require.NoError(t, db.QueryRow(context.Background(),
+		`SELECT total_amount FROM bills WHERE id = $1`, bill.ID).Scan(&total))
+
+	assert.Equal(t, 1, itemCount, "duplicate item must not insert twice")
+	assert.Equal(t, 1, eventCount, "duplicate item must not emit a second event")
+	assert.True(t, decimal.NewFromInt(10).Equal(total), "total must not double-count")
+}
+
 func TestAuthHandler_RejectsMissingHeader(t *testing.T) {
 	_, _, err := AuthHandler(context.Background(), &AuthParams{AccountID: ""})
 	require.Error(t, err)

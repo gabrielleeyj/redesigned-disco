@@ -644,6 +644,115 @@ func (s *Service) ListLineItems(ctx context.Context, id string, req *ListLineIte
 	}, nil
 }
 
+type ListBillEventsRequest struct {
+	Cursor string `query:"cursor"`
+	Limit  int    `query:"limit"`
+}
+
+type ListBillEventsResponse struct {
+	Events     []BillEvent `json:"events"`
+	NextCursor string      `json:"nextCursor,omitempty"`
+	Limit      int         `json:"limit"`
+}
+
+//encore:api auth method=GET path=/bills/:id/events
+//
+// ListBillEvents returns the bill's append-only audit log in
+// chronological order. The table is immutable at the DB layer
+// (UPDATE/DELETE triggers); this endpoint is read-only.
+func (s *Service) ListBillEvents(ctx context.Context, id string, req *ListBillEventsRequest) (*ListBillEventsResponse, error) {
+	if err := s.assertOwnsBill(ctx, id); err != nil {
+		return nil, err
+	}
+
+	limit := defaultListLimit
+	if req != nil {
+		if req.Limit < 0 {
+			return nil, &errs.Error{
+				Code:    errs.InvalidArgument,
+				Message: "limit must be non-negative",
+			}
+		}
+		if req.Limit > 0 {
+			limit = req.Limit
+		}
+	}
+	if limit > maxListLimit {
+		limit = maxListLimit
+	}
+
+	var (
+		cursorTime time.Time
+		cursorID   string
+	)
+	if req != nil && req.Cursor != "" {
+		ts, eid, err := decodeKeysetCursor(req.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		cursorTime, cursorID = ts, eid
+	}
+
+	var rows *sqldb.Rows
+	var err error
+	if cursorID == "" {
+		rows, err = db.Query(ctx, `
+			SELECT id, bill_id, kind, actor, payload, created_at
+			FROM bill_events
+			WHERE bill_id = $1
+			ORDER BY created_at, id
+			LIMIT $2`, id, limit+1)
+	} else {
+		rows, err = db.Query(ctx, `
+			SELECT id, bill_id, kind, actor, payload, created_at
+			FROM bill_events
+			WHERE bill_id = $1 AND (created_at, id) > ($2, $3)
+			ORDER BY created_at, id
+			LIMIT $4`, id, cursorTime, cursorID, limit+1)
+	}
+	if err != nil {
+		rlog.Error("list bill events query failed", "bill_id", id, "err", err)
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: "failed to list bill events",
+		}
+	}
+	defer rows.Close()
+
+	events := []BillEvent{}
+	for rows.Next() {
+		var e BillEvent
+		var kind string
+		if err := rows.Scan(&e.ID, &e.BillID, &kind, &e.Actor, &e.Payload, &e.CreatedAt); err != nil {
+			return nil, &errs.Error{
+				Code:    errs.Internal,
+				Message: "failed to scan bill event",
+			}
+		}
+		e.Kind = BillEventKind(kind)
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, &errs.Error{
+			Code:    errs.Internal,
+			Message: fmt.Sprintf("iterating bill events: %v", err),
+		}
+	}
+
+	var nextCursor string
+	if len(events) > limit {
+		last := events[limit-1]
+		nextCursor = encodeLineItemCursor(last.CreatedAt, last.ID)
+		events = events[:limit]
+	}
+
+	return &ListBillEventsResponse{
+		Events:     events,
+		NextCursor: nextCursor,
+		Limit:      limit,
+	}, nil
+}
+
 func decodeLineItemCursor(req *ListLineItemsRequest) (time.Time, string, error) {
 	if req == nil || req.Cursor == "" {
 		return time.Time{}, "", nil
