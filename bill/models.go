@@ -57,6 +57,20 @@ const (
 	BillStatusClosed BillStatus = "CLOSED"
 )
 
+// CloseReason records why a bill transitioned from OPEN to CLOSED.
+// Persisted so audits and downstream consumers can distinguish a
+// caller-initiated close from an automatic period-end finalisation.
+type CloseReason string
+
+const (
+	// CloseReasonSignal indicates the bill was closed by an explicit
+	// CloseBill call (caller-initiated).
+	CloseReasonSignal CloseReason = "SIGNAL"
+	// CloseReasonPeriodEnd indicates the workflow's period-end timer
+	// fired and finalised the bill automatically.
+	CloseReasonPeriodEnd CloseReason = "PERIOD_END"
+)
+
 // Money carries an arbitrary-precision decimal amount tagged with a currency.
 // Persistence and arithmetic preserve full precision; rounding is applied at
 // display boundaries only.
@@ -99,12 +113,17 @@ type Bill struct {
 	TotalAmount decimal.Decimal `json:"totalAmount"`
 	CreatedAt   time.Time       `json:"createdAt"`
 	ClosedAt    *time.Time      `json:"closedAt,omitempty"`
+	PeriodStart *time.Time      `json:"periodStart,omitempty"`
+	PeriodEnd   *time.Time      `json:"periodEnd,omitempty"`
+	CloseReason CloseReason     `json:"closeReason,omitempty"`
 }
 
 // BillWorkflowInput is the argument to BillingWorkflow.
 type BillWorkflowInput struct {
-	BillID   string   `json:"billId"`
-	Currency Currency `json:"currency"`
+	BillID      string     `json:"billId"`
+	Currency    Currency   `json:"currency"`
+	PeriodStart *time.Time `json:"periodStart,omitempty"`
+	PeriodEnd   *time.Time `json:"periodEnd,omitempty"`
 	// Snapshot carries accumulated bill state across ContinueAsNew boundaries.
 	// Nil for the initial workflow run.
 	Snapshot *Bill `json:"snapshot,omitempty"`
@@ -116,4 +135,5 @@ type BillResult struct {
 	TotalAmount decimal.Decimal `json:"totalAmount"`
 	Currency    Currency        `json:"currency"`
 	ItemCount   int             `json:"itemCount"`
+	CloseReason CloseReason     `json:"closeReason"`
 }

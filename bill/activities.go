@@ -7,6 +7,16 @@ import (
 	"encore.dev/rlog"
 )
 
+// nullableCloseReason converts the CloseReason enum into a value suitable
+// for INSERT — empty string becomes SQL NULL so the column's CHECK
+// constraint isn't violated on intermediate writes.
+func nullableCloseReason(r CloseReason) interface{} {
+	if r == "" {
+		return nil
+	}
+	return string(r)
+}
+
 // PersistBillActivity writes the closed bill and its line items to the DB
 // inside a single transaction. Uses ON CONFLICT upserts so retries are
 // idempotent — the activity's retry policy may invoke it more than once
@@ -27,13 +37,16 @@ func PersistBillActivity(ctx context.Context, bill Bill) error {
 	}()
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO bills (id, status, currency, total_amount, created_at, closed_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO bills (id, status, currency, total_amount, created_at, closed_at, period_start, period_end, close_reason)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (id) DO UPDATE SET
 			status = EXCLUDED.status,
 			total_amount = EXCLUDED.total_amount,
-			closed_at = EXCLUDED.closed_at`,
-		bill.ID, string(bill.Status), string(bill.Currency), bill.TotalAmount, bill.CreatedAt, bill.ClosedAt,
+			closed_at = EXCLUDED.closed_at,
+			close_reason = EXCLUDED.close_reason`,
+		bill.ID, string(bill.Status), string(bill.Currency), bill.TotalAmount,
+		bill.CreatedAt, bill.ClosedAt, bill.PeriodStart, bill.PeriodEnd,
+		nullableCloseReason(bill.CloseReason),
 	)
 	if err != nil {
 		return fmt.Errorf("insert bill: %w", err)

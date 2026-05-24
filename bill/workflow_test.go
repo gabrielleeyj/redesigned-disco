@@ -128,6 +128,70 @@ func TestBillingWorkflow(t *testing.T) {
 	}
 }
 
+func TestBillingWorkflow_PeriodEndAutoCloses(t *testing.T) {
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+
+	env.RegisterActivity(PersistBillActivity)
+	env.OnActivity(PersistBillActivity, mock.Anything, mock.Anything).Return(nil)
+
+	// Test environment advances mock time as registered callbacks fire.
+	// Setting PeriodEnd to start+1h with an item added at t=1ms exercises
+	// the timer path without any CloseBill signal.
+	start := time.Now()
+	end := start.Add(time.Hour)
+
+	env.RegisterDelayedCallback(func() {
+		env.UpdateWorkflow(UpdateAddLineItem, "", &testsuite.TestUpdateCallback{
+			OnAccept:   func() {},
+			OnReject:   func(err error) { t.Errorf("rejected: %v", err) },
+			OnComplete: func(_ interface{}, err error) { assert.NoError(t, err) },
+		}, AddLineItemInput{ItemID: "i1", Description: "Fee", Amount: dec("10.00"), Currency: CurrencyUSD})
+	}, time.Millisecond)
+
+	env.ExecuteWorkflow(BillingWorkflow, BillWorkflowInput{
+		BillID:    "bill-period",
+		Currency:  CurrencyUSD,
+		PeriodEnd: &end,
+	})
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+
+	var result BillResult
+	require.NoError(t, env.GetWorkflowResult(&result))
+	assert.Equal(t, CloseReasonPeriodEnd, result.CloseReason)
+	assert.Equal(t, 1, result.ItemCount)
+}
+
+func TestBillingWorkflow_SignalBeatsTimer(t *testing.T) {
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+
+	env.RegisterActivity(PersistBillActivity)
+	env.OnActivity(PersistBillActivity, mock.Anything, mock.Anything).Return(nil)
+
+	// PeriodEnd far in the future; CloseBill arrives first → reason=SIGNAL.
+	end := time.Now().Add(24 * time.Hour)
+
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(SignalCloseBill, CloseBillSignal{})
+	}, time.Millisecond)
+
+	env.ExecuteWorkflow(BillingWorkflow, BillWorkflowInput{
+		BillID:    "bill-signal-wins",
+		Currency:  CurrencyUSD,
+		PeriodEnd: &end,
+	})
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+
+	var result BillResult
+	require.NoError(t, env.GetWorkflowResult(&result))
+	assert.Equal(t, CloseReasonSignal, result.CloseReason)
+}
+
 func TestBillingWorkflow_ActivityRetried(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestWorkflowEnvironment()

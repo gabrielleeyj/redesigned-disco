@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"encore.dev/beta/errs"
 	"encore.dev/rlog"
@@ -25,12 +26,20 @@ const (
 
 type CreateBillRequest struct {
 	Currency string `json:"currency"`
+	// PeriodStart and PeriodEnd bracket the fee accrual window. Both are
+	// optional; when PeriodEnd is set, the workflow auto-closes when the
+	// timer fires (no explicit CloseBill needed). When unset, the bill
+	// stays open until explicitly closed.
+	PeriodStart *time.Time `json:"periodStart,omitempty"`
+	PeriodEnd   *time.Time `json:"periodEnd,omitempty"`
 }
 
 type CreateBillResponse struct {
-	BillID   string `json:"billId"`
-	Status   string `json:"status"`
-	Currency string `json:"currency"`
+	BillID      string     `json:"billId"`
+	Status      string     `json:"status"`
+	Currency    string     `json:"currency"`
+	PeriodStart *time.Time `json:"periodStart,omitempty"`
+	PeriodEnd   *time.Time `json:"periodEnd,omitempty"`
 }
 
 //encore:api public method=POST path=/bills
@@ -42,13 +51,18 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Crea
 			Message: fmt.Sprintf("invalid currency: %s", req.Currency),
 		}
 	}
+	if err := validatePeriod(req.PeriodStart, req.PeriodEnd); err != nil {
+		return nil, err
+	}
 
 	billID := uuid.New().String()
 	workflowID := fmt.Sprintf("bill-%s", billID)
 
 	input := BillWorkflowInput{
-		BillID:   billID,
-		Currency: currency,
+		BillID:      billID,
+		Currency:    currency,
+		PeriodStart: req.PeriodStart,
+		PeriodEnd:   req.PeriodEnd,
 	}
 
 	_, err := s.temporalClient.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
@@ -70,10 +84,25 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Crea
 	}
 
 	return &CreateBillResponse{
-		BillID:   billID,
-		Status:   string(BillStatusOpen),
-		Currency: string(currency),
+		BillID:      billID,
+		Status:      string(BillStatusOpen),
+		Currency:    string(currency),
+		PeriodStart: req.PeriodStart,
+		PeriodEnd:   req.PeriodEnd,
 	}, nil
+}
+
+// validatePeriod rejects obviously-bad period configurations. PeriodEnd
+// in the past is allowed (the workflow fires the timer immediately and
+// closes), which keeps backdated bookkeeping bills supportable.
+func validatePeriod(start, end *time.Time) error {
+	if start != nil && end != nil && !end.After(*start) {
+		return &errs.Error{
+			Code:    errs.InvalidArgument,
+			Message: "periodEnd must be after periodStart",
+		}
+	}
+	return nil
 }
 
 type AddLineItemRequest struct {
@@ -325,7 +354,8 @@ func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBi
 	limit, offset := normalizeListPagination(req)
 
 	rows, err := db.Query(ctx, `
-		SELECT id, status, currency, total_amount, created_at, closed_at
+		SELECT id, status, currency, total_amount, created_at, closed_at,
+		       period_start, period_end, close_reason
 		FROM bills ORDER BY created_at DESC
 		LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
@@ -338,8 +368,8 @@ func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBi
 
 	bills := []Bill{}
 	for rows.Next() {
-		var b Bill
-		if err := rows.Scan(&b.ID, &b.Status, &b.Currency, &b.TotalAmount, &b.CreatedAt, &b.ClosedAt); err != nil {
+		b, err := scanBillRow(rows)
+		if err != nil {
 			return nil, &errs.Error{
 				Code:    errs.Internal,
 				Message: "failed to scan bill",
@@ -374,6 +404,30 @@ func normalizeListPagination(req *ListBillsRequest) (limit, offset int) {
 	return limit, offset
 }
 
+// rowScanner abstracts over *sqldb.Row and *sqldb.Rows so a single Bill
+// scan path serves both QueryRow and Query callers. Keeping the column
+// list in one place stops the two reads from drifting.
+type rowScanner interface {
+	Scan(dest ...interface{}) error
+}
+
+func scanBillRow(s rowScanner) (Bill, error) {
+	var (
+		b           Bill
+		closeReason *string
+	)
+	if err := s.Scan(
+		&b.ID, &b.Status, &b.Currency, &b.TotalAmount, &b.CreatedAt, &b.ClosedAt,
+		&b.PeriodStart, &b.PeriodEnd, &closeReason,
+	); err != nil {
+		return Bill{}, err
+	}
+	if closeReason != nil {
+		b.CloseReason = CloseReason(*closeReason)
+	}
+	return b, nil
+}
+
 func (s *Service) queryBillState(ctx context.Context, workflowID string) (Bill, error) {
 	resp, err := s.temporalClient.QueryWorkflow(ctx, workflowID, emptyRunID, QueryBillState)
 	if err != nil {
@@ -386,12 +440,11 @@ func (s *Service) queryBillState(ctx context.Context, workflowID string) (Bill, 
 }
 
 func (s *Service) getBillFromDB(ctx context.Context, id string) (Bill, error) {
-	var b Bill
-	err := db.QueryRow(ctx, `
-		SELECT id, status, currency, total_amount, created_at, closed_at
-		FROM bills WHERE id = $1`, id).Scan(
-		&b.ID, &b.Status, &b.Currency, &b.TotalAmount, &b.CreatedAt, &b.ClosedAt,
-	)
+	row := db.QueryRow(ctx, `
+		SELECT id, status, currency, total_amount, created_at, closed_at,
+		       period_start, period_end, close_reason
+		FROM bills WHERE id = $1`, id)
+	b, err := scanBillRow(row)
 	if err != nil {
 		return Bill{}, err
 	}
