@@ -1,17 +1,11 @@
 services:
+  # temporalio/temporal bundles the dev server (formerly temporalite)
+  # with SQLite-backed storage and a built-in web UI. Use this for
+  # local development; a production deployment would run a Temporal
+  # cluster backed by Postgres/MySQL/Cassandra.
   temporal:
-    image: temporalio/auto-setup:latest
+    image: temporalio/temporal:latest
+    command: server start-dev --ip 0.0.0.0 --ui-port 8233
     ports:
-      - "7233:7233"
-    environment:
-      - DB=sqlite
-      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
-
-  temporal-ui:
-    image: temporalio/ui:latest
-    ports:
-      - "8233:8080"
-    environment:
-      - TEMPORAL_ADDRESS=temporal:7233
-    depends_on:
-      - temporal
+      - "7233:7233"   # gRPC frontend (Encore worker connects here)
+      - "8233:8233"   # Web UI
