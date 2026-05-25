@@ -64,11 +64,8 @@ type CreateBillResponse struct {
 	PeriodEnd   *time.Time `json:"periodEnd,omitempty"`
 }
 
-//encore:api auth method=POST path=/bills
+//encore:api auth method=POST path=/bills tag:mutating
 func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*CreateBillResponse, error) {
-	if err := assertActiveCaller(ctx); err != nil {
-		return nil, err
-	}
 	currency := Currency(req.Currency)
 	if !currency.Valid() {
 		return nil, &errs.Error{
@@ -197,11 +194,8 @@ type AddLineItemResponse struct {
 	ItemCount int    `json:"itemCount"`
 }
 
-//encore:api auth method=POST path=/bills/:id/line-items
+//encore:api auth method=POST path=/bills/:id/line-items tag:mutating
 func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRequest) (*AddLineItemResponse, error) {
-	if err := assertActiveCaller(ctx); err != nil {
-		return nil, err
-	}
 	if req.Description == "" {
 		return nil, &errs.Error{
 			Code:    errs.InvalidArgument,
@@ -361,7 +355,7 @@ type CloseBillResponse struct {
 	CloseReason CloseReason    `json:"closeReason,omitempty"`
 }
 
-//encore:api auth method=POST path=/bills/:id/close
+//encore:api auth method=POST path=/bills/:id/close tag:mutating
 //
 // CloseBill is idempotent. If the workflow has already completed (e.g.
 // the caller is retrying a successful close, or the period-end timer
@@ -369,9 +363,6 @@ type CloseBillResponse struct {
 // same response shape as a first-time close. Only an unknown bill ID
 // produces a 404.
 func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse, error) {
-	if err := assertActiveCaller(ctx); err != nil {
-		return nil, err
-	}
 	if err := s.assertOwnsBill(ctx, id); err != nil {
 		return nil, err
 	}

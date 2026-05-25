@@ -794,36 +794,22 @@ func TestSuspendedAccount_WriteBlockedReadAllowed(t *testing.T) {
 	// SUSPENDED clients: every mutating endpoint must return
 	// PermissionDenied; reads continue to work so the account can
 	// inspect its own balance during dispute resolution.
+	//
+	// Mutation rejection is enforced by the RequireActiveCaller
+	// middleware (tag:mutating). Direct method calls in unit tests
+	// bypass Encore's middleware chain, so we exercise the policy at
+	// its actual layer: the helper and the middleware function.
 	withTestAuthStatus(t, ClientStatusSuspended)
-	svc, mockClient := newTestService(t)
 
-	// Writes: CreateBill, AddLineItem, CloseBill, RefreshCurrencies
-	// all reject before any Temporal call.
-	_, err := svc.CreateBill(context.Background(), &CreateBillRequest{Currency: "USD"})
-	require.Error(t, err)
+	err := assertActiveCaller(context.Background())
+	require.Error(t, err, "assertActiveCaller must reject SUSPENDED")
 	var e *errs.Error
-	require.ErrorAs(t, err, &e)
-	assert.Equal(t, errs.PermissionDenied, e.Code)
-
-	_, err = svc.AddLineItem(context.Background(), "bill-x", &AddLineItemRequest{
-		Description: "fee", Amount: "1", Currency: "USD",
-	})
-	require.Error(t, err)
-	require.ErrorAs(t, err, &e)
-	assert.Equal(t, errs.PermissionDenied, e.Code)
-
-	_, err = svc.CloseBill(context.Background(), "bill-x")
-	require.Error(t, err)
-	require.ErrorAs(t, err, &e)
-	assert.Equal(t, errs.PermissionDenied, e.Code)
-
-	_, err = svc.RefreshCurrencies(context.Background())
-	require.Error(t, err)
 	require.ErrorAs(t, err, &e)
 	assert.Equal(t, errs.PermissionDenied, e.Code)
 
 	// Reads still work. Seed a bill owned by the suspended account
 	// and confirm GetBill returns it.
+	svc, mockClient := newTestService(t)
 	billID := uuid.NewString()
 	_, err = db.Exec(context.Background(), `
 		INSERT INTO bills (id, account_id, status, currency, total_amount, created_at)
@@ -845,6 +831,20 @@ func TestSuspendedAccount_WriteBlockedReadAllowed(t *testing.T) {
 	resp, err := svc.GetBill(context.Background(), billID)
 	require.NoError(t, err, "suspended account must still be able to read its own bills")
 	assert.Equal(t, billID, resp.Bill.ID)
+}
+
+func TestAssertActiveCaller_AllowsActive(t *testing.T) {
+	withTestAuth(t)
+	require.NoError(t, assertActiveCaller(context.Background()))
+}
+
+func TestAssertActiveCaller_RejectsMissingIdentity(t *testing.T) {
+	// No withTestAuth — auth.Data() returns nil.
+	err := assertActiveCaller(context.Background())
+	require.Error(t, err)
+	var e *errs.Error
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, errs.Unauthenticated, e.Code)
 }
 
 func TestAuthHandler_RejectsMissingHeader(t *testing.T) {

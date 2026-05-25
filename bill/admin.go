@@ -13,7 +13,7 @@ type RefreshCurrenciesResponse struct {
 	RefreshedAt   time.Time `json:"refreshedAt"`
 }
 
-//encore:api auth method=POST path=/admin/currencies/refresh
+//encore:api auth method=POST path=/admin/currencies/refresh tag:mutating
 //
 // RefreshCurrencies forces an immediate reload of the currency
 // registry from the DB. Useful after INSERT-ing a new currency so
@@ -26,9 +26,6 @@ type RefreshCurrenciesResponse struct {
 // production posture. Wire role-based access control when the auth
 // handler is replaced (see auth.go TODO).
 func (s *Service) RefreshCurrencies(ctx context.Context) (*RefreshCurrenciesResponse, error) {
-	if err := assertActiveCaller(ctx); err != nil {
-		return nil, err
-	}
 	count, err := refreshCurrencies(ctx)
 	if err != nil {
 		rlog.Error("currency registry refresh failed", "err", err)
