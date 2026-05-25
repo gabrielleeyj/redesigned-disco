@@ -195,23 +195,33 @@ func TestAddLineItem_InvalidInput(t *testing.T) {
 	}{
 		{
 			name:    "empty description",
-			req:     &AddLineItemRequest{Description: "", Amount: decimal.NewFromInt(10), Currency: "USD"},
+			req:     &AddLineItemRequest{Description: "", Amount: "10", Currency: "USD"},
 			wantErr: "description is required",
 		},
 		{
 			name:    "zero amount",
-			req:     &AddLineItemRequest{Description: "Fee", Amount: decimal.Zero, Currency: "USD"},
+			req:     &AddLineItemRequest{Description: "Fee", Amount: "0", Currency: "USD"},
 			wantErr: "amount must be positive",
 		},
 		{
 			name:    "negative amount",
-			req:     &AddLineItemRequest{Description: "Fee", Amount: decimal.NewFromInt(-1), Currency: "USD"},
+			req:     &AddLineItemRequest{Description: "Fee", Amount: "-1", Currency: "USD"},
 			wantErr: "amount must be positive",
 		},
 		{
 			name:    "unsupported currency",
-			req:     &AddLineItemRequest{Description: "Fee", Amount: decimal.NewFromInt(10), Currency: "XYZ"},
+			req:     &AddLineItemRequest{Description: "Fee", Amount: "10", Currency: "XYZ"},
 			wantErr: "invalid currency",
+		},
+		{
+			name:    "non-numeric amount",
+			req:     &AddLineItemRequest{Description: "Fee", Amount: "abc", Currency: "USD"},
+			wantErr: "decimal string",
+		},
+		{
+			name:    "empty amount",
+			req:     &AddLineItemRequest{Description: "Fee", Amount: "", Currency: "USD"},
+			wantErr: "amount is required",
 		},
 	}
 
@@ -237,7 +247,7 @@ func TestAddLineItem_ClosedBill(t *testing.T) {
 
 	_, err := svc.AddLineItem(context.Background(), "closed-bill", &AddLineItemRequest{
 		Description: "Fee",
-		Amount:      decimal.NewFromInt(10),
+		Amount:      "10",
 		Currency:    "USD",
 	})
 
@@ -279,7 +289,7 @@ func TestAddLineItem_TemporalUnavailable(t *testing.T) {
 
 	_, err := svc.AddLineItem(context.Background(), "some-bill", &AddLineItemRequest{
 		Description: "Fee",
-		Amount:      decimal.NewFromInt(10),
+		Amount:      "10",
 		Currency:    "USD",
 	})
 
@@ -301,7 +311,7 @@ func TestAddLineItem_ContextCanceled(t *testing.T) {
 
 	_, err := svc.AddLineItem(ctx, "some-bill", &AddLineItemRequest{
 		Description: "Fee",
-		Amount:      decimal.NewFromInt(10),
+		Amount:      "10",
 		Currency:    "USD",
 	})
 
@@ -386,7 +396,9 @@ func TestCloseBill_IdempotentRetryReturnsPersistedBill(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, billID, resp.BillID)
 	assert.Equal(t, "CLOSED", resp.Status)
-	assert.True(t, decimal.RequireFromString("42.50").Equal(resp.TotalAmount))
+	gotTotal, err := decimal.NewFromString(resp.TotalAmount)
+	require.NoError(t, err)
+	assert.True(t, decimal.RequireFromString("42.50").Equal(gotTotal))
 }
 
 func TestCloseBill_OwnershipMismatchReturns404(t *testing.T) {
@@ -794,7 +806,7 @@ func TestSuspendedAccount_WriteBlockedReadAllowed(t *testing.T) {
 	assert.Equal(t, errs.PermissionDenied, e.Code)
 
 	_, err = svc.AddLineItem(context.Background(), "bill-x", &AddLineItemRequest{
-		Description: "fee", Amount: decimal.NewFromInt(1), Currency: "USD",
+		Description: "fee", Amount: "1", Currency: "USD",
 	})
 	require.Error(t, err)
 	require.ErrorAs(t, err, &e)

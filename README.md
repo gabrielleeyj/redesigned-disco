@@ -117,9 +117,10 @@ ITEM_ADDED, CLOSED) inside the same DB transaction as the bill mutation.
 | POST   | `/admin/currencies/refresh`       | Force currency registry reload                   |
 
 All endpoints require the `X-Account-Id` header (stub auth, see below).
-Amounts are JSON strings (full decimal precision). Currencies are
-ISO-4217 codes; whether a code is accepted is governed by the
-`currencies` table.
+Amounts are JSON strings (e.g. `"15.99"`, `"0.0001"`) so full decimal
+precision is preserved end-to-end — no float, no minor-unit ints.
+Currencies are ISO-4217 codes; whether a code is accepted is governed
+by the `currencies` table.
 
 ### Authentication (stub)
 

@@ -12,7 +12,6 @@ import (
 	"encore.dev/rlog"
 	"encore.dev/storage/sqldb"
 	"github.com/google/uuid"
-	"github.com/shopspring/decimal"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
@@ -182,16 +181,20 @@ func validatePeriod(start, end *time.Time) error {
 }
 
 type AddLineItemRequest struct {
-	IdempotencyKey string          `json:"idempotencyKey"`
-	Description    string          `json:"description"`
-	Amount         decimal.Decimal `json:"amount"`
-	Currency       string          `json:"currency"`
+	IdempotencyKey string `json:"idempotencyKey"`
+	Description    string `json:"description"`
+	// Amount is a decimal string ("15.99", "0.0001"). Using a string
+	// on the wire avoids float precision loss AND keeps the Encore
+	// schema honest — shopspring/decimal.Decimal would otherwise be
+	// introspected as a nested object in the dev dashboard.
+	Amount   string `json:"amount"`
+	Currency string `json:"currency"`
 }
 
 type AddLineItemResponse struct {
-	ItemID    string          `json:"itemId"`
-	BillTotal decimal.Decimal `json:"billTotal"`
-	ItemCount int             `json:"itemCount"`
+	ItemID    string `json:"itemId"`
+	BillTotal string `json:"billTotal"`
+	ItemCount int    `json:"itemCount"`
 }
 
 //encore:api auth method=POST path=/bills/:id/line-items
@@ -205,11 +208,9 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 			Message: "description is required",
 		}
 	}
-	if !req.Amount.IsPositive() {
-		return nil, &errs.Error{
-			Code:    errs.InvalidArgument,
-			Message: "amount must be positive",
-		}
+	amount, parseErr := parseAmount(req.Amount)
+	if parseErr != nil {
+		return nil, parseErr
 	}
 	currency := Currency(req.Currency)
 	if !currency.Valid() {
@@ -229,7 +230,7 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 	in := AddLineItemInput{
 		ItemID:          itemID,
 		Description:     req.Description,
-		Amount:          req.Amount,
+		Amount:          amount,
 		Currency:        currency,
 		CallerAccountID: callerAccountID(ctx),
 	}
@@ -252,7 +253,7 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 
 	return &AddLineItemResponse{
 		ItemID:    result.ItemID,
-		BillTotal: result.BillTotal,
+		BillTotal: result.BillTotal.String(),
 		ItemCount: result.ItemCount,
 	}, nil
 }
@@ -351,13 +352,13 @@ func classifyUpdateError(err error) *errs.Error {
 }
 
 type CloseBillResponse struct {
-	BillID      string          `json:"billId"`
-	Status      string          `json:"status"`
-	TotalAmount decimal.Decimal `json:"totalAmount"`
-	Currency    string          `json:"currency"`
-	LineItems   []LineItem      `json:"lineItems"`
-	ClosedAt    *time.Time      `json:"closedAt,omitempty"`
-	CloseReason CloseReason     `json:"closeReason,omitempty"`
+	BillID      string         `json:"billId"`
+	Status      string         `json:"status"`
+	TotalAmount string         `json:"totalAmount"`
+	Currency    string         `json:"currency"`
+	LineItems   []LineItemView `json:"lineItems"`
+	ClosedAt    *string        `json:"closedAt,omitempty"`
+	CloseReason CloseReason    `json:"closeReason,omitempty"`
 }
 
 //encore:api auth method=POST path=/bills/:id/close
@@ -427,19 +428,23 @@ func (s *Service) closeBillFromDB(ctx context.Context, id string) (*CloseBillRes
 		}
 	}
 
-	return &CloseBillResponse{
+	resp := &CloseBillResponse{
 		BillID:      bill.ID,
 		Status:      string(bill.Status),
-		TotalAmount: bill.TotalAmount,
+		TotalAmount: bill.TotalAmount.String(),
 		Currency:    string(bill.Currency),
-		LineItems:   items,
-		ClosedAt:    bill.ClosedAt,
+		LineItems:   toLineItemViews(items),
 		CloseReason: bill.CloseReason,
-	}, nil
+	}
+	if bill.ClosedAt != nil {
+		s := bill.ClosedAt.Format(rfc3339Nano)
+		resp.ClosedAt = &s
+	}
+	return resp, nil
 }
 
 type GetBillResponse struct {
-	Bill Bill `json:"bill"`
+	Bill BillView `json:"bill"`
 }
 
 //encore:api auth method=GET path=/bills/:id
@@ -467,7 +472,7 @@ func (s *Service) GetBill(ctx context.Context, id string) (*GetBillResponse, err
 		}
 	}
 	summary.LineItems = items
-	return &GetBillResponse{Bill: summary}, nil
+	return &GetBillResponse{Bill: toBillView(summary)}, nil
 }
 
 // loadBillSummary resolves a bill ID to its summary state (no line
@@ -579,9 +584,9 @@ type ListLineItemsRequest struct {
 }
 
 type ListLineItemsResponse struct {
-	Items      []LineItem `json:"items"`
-	NextCursor string     `json:"nextCursor,omitempty"`
-	Limit      int        `json:"limit"`
+	Items      []LineItemView `json:"items"`
+	NextCursor string         `json:"nextCursor,omitempty"`
+	Limit      int            `json:"limit"`
 }
 
 //encore:api auth method=GET path=/bills/:id/line-items
@@ -672,7 +677,7 @@ func (s *Service) ListLineItems(ctx context.Context, id string, req *ListLineIte
 	}
 
 	return &ListLineItemsResponse{
-		Items:      items,
+		Items:      toLineItemViews(items),
 		NextCursor: nextCursor,
 		Limit:      limit,
 	}, nil
@@ -809,9 +814,9 @@ type ListBillsRequest struct {
 }
 
 type ListBillsResponse struct {
-	Bills      []Bill `json:"bills"`
-	NextCursor string `json:"nextCursor,omitempty"`
-	Limit      int    `json:"limit"`
+	Bills      []BillView `json:"bills"`
+	NextCursor string     `json:"nextCursor,omitempty"`
+	Limit      int        `json:"limit"`
 }
 
 //encore:api auth method=GET path=/bills
@@ -881,7 +886,11 @@ func (s *Service) ListBills(ctx context.Context, req *ListBillsRequest) (*ListBi
 		bills = bills[:limit]
 	}
 
-	return &ListBillsResponse{Bills: bills, NextCursor: nextCursor, Limit: limit}, nil
+	views := make([]BillView, len(bills))
+	for i, b := range bills {
+		views[i] = toBillView(b)
+	}
+	return &ListBillsResponse{Bills: views, NextCursor: nextCursor, Limit: limit}, nil
 }
 
 // normalizeListStatus accepts OPEN, CLOSED, or empty. Empty returns
