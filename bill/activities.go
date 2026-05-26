@@ -28,6 +28,11 @@ func nullableCloseReason(r CloseReason) interface{} {
 // than a constraint failure. The event insert is skipped on the
 // no-op path (gated by RETURNING).
 func CreateBillActivity(ctx context.Context, bill Bill) error {
+	type openedPayload struct {
+		Currency    Currency   `json:"currency"`
+		PeriodStart *time.Time `json:"periodStart,omitempty"`
+		PeriodEnd   *time.Time `json:"periodEnd,omitempty"`
+	}
 	return inTx(ctx, "create bill", bill.ID, func(tx *sqldb.Tx) error {
 		var inserted string
 		err := tx.QueryRow(ctx, `
@@ -48,10 +53,10 @@ func CreateBillActivity(ctx context.Context, bill Bill) error {
 			return fmt.Errorf("insert bill: %w", err)
 		}
 
-		payload, _ := json.Marshal(map[string]interface{}{
-			"currency":    bill.Currency,
-			"periodStart": bill.PeriodStart,
-			"periodEnd":   bill.PeriodEnd,
+		payload, _ := json.Marshal(openedPayload{
+			Currency:    bill.Currency,
+			PeriodStart: bill.PeriodStart,
+			PeriodEnd:   bill.PeriodEnd,
 		})
 		if err := appendEvent(ctx, tx, bill.ID, BillEventOpened, bill.AccountID, payload); err != nil {
 			return err
@@ -67,6 +72,12 @@ func CreateBillActivity(ctx context.Context, bill Bill) error {
 // insert is a no-op, the total is not double-counted, and the event
 // is not duplicated either.
 func AppendLineItemActivity(ctx context.Context, in AppendLineItemInput) error {
+	type itemAddedPayload struct {
+		ItemID      string   `json:"itemId"`
+		Description string   `json:"description"`
+		Amount      string   `json:"amount"`
+		Currency    Currency `json:"currency"`
+	}
 	return inTx(ctx, "append line item", in.BillID, func(tx *sqldb.Tx) error {
 		var inserted string
 		err := tx.QueryRow(ctx, `
@@ -91,11 +102,11 @@ func AppendLineItemActivity(ctx context.Context, in AppendLineItemInput) error {
 			return fmt.Errorf("update bill total: %w", err)
 		}
 
-		payload, _ := json.Marshal(map[string]interface{}{
-			"itemId":      in.Item.ID,
-			"description": in.Item.Description,
-			"amount":      in.Item.Amount.String(),
-			"currency":    in.Item.Currency,
+		payload, _ := json.Marshal(itemAddedPayload{
+			ItemID:      in.Item.ID,
+			Description: in.Item.Description,
+			Amount:      in.Item.Amount.String(),
+			Currency:    in.Item.Currency,
 		})
 		if err := appendEvent(ctx, tx, in.BillID, BillEventItemAdded, in.Actor, payload); err != nil {
 			return err
@@ -111,6 +122,10 @@ func AppendLineItemActivity(ctx context.Context, in AppendLineItemInput) error {
 // than recomputed in SQL) so the workflow's computed total is the
 // source of truth.
 func CloseBillActivity(ctx context.Context, in CloseBillActivityInput) error {
+	type closedPayload struct {
+		TotalAmount string      `json:"totalAmount"`
+		CloseReason CloseReason `json:"closeReason"`
+	}
 	return inTx(ctx, "close bill", in.BillID, func(tx *sqldb.Tx) error {
 		if _, err := tx.Exec(ctx, `
 			UPDATE bills
@@ -124,9 +139,9 @@ func CloseBillActivity(ctx context.Context, in CloseBillActivityInput) error {
 			return fmt.Errorf("update bill on close: %w", err)
 		}
 
-		payload, _ := json.Marshal(map[string]interface{}{
-			"totalAmount": in.TotalAmount.String(),
-			"closeReason": in.CloseReason,
+		payload, _ := json.Marshal(closedPayload{
+			TotalAmount: in.TotalAmount.String(),
+			CloseReason: in.CloseReason,
 		})
 		if err := appendEvent(ctx, tx, in.BillID, BillEventClosed, in.Actor, payload); err != nil {
 			return err

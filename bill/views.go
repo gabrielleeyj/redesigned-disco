@@ -1,6 +1,8 @@
 package bill
 
 import (
+	"time"
+
 	"encore.dev/beta/errs"
 	"github.com/shopspring/decimal"
 )
@@ -49,19 +51,19 @@ func toBillView(b Bill) BillView {
 		Currency:    b.Currency,
 		TotalAmount: b.TotalAmount.String(),
 		ItemCount:   b.ItemCount,
-		CreatedAt:   b.CreatedAt.Format(rfc3339Nano),
+		CreatedAt:   b.CreatedAt.Format(time.RFC3339Nano),
 		CloseReason: b.CloseReason,
 	}
 	if b.ClosedAt != nil {
-		s := b.ClosedAt.Format(rfc3339Nano)
+		s := b.ClosedAt.Format(time.RFC3339Nano)
 		v.ClosedAt = &s
 	}
 	if b.PeriodStart != nil {
-		s := b.PeriodStart.Format(rfc3339Nano)
+		s := b.PeriodStart.Format(time.RFC3339Nano)
 		v.PeriodStart = &s
 	}
 	if b.PeriodEnd != nil {
-		s := b.PeriodEnd.Format(rfc3339Nano)
+		s := b.PeriodEnd.Format(time.RFC3339Nano)
 		v.PeriodEnd = &s
 	}
 	if b.LineItems != nil {
@@ -76,7 +78,7 @@ func toLineItemView(i LineItem) LineItemView {
 		Description: i.Description,
 		Amount:      i.Amount.String(),
 		Currency:    i.Currency,
-		CreatedAt:   i.CreatedAt.Format(rfc3339Nano),
+		CreatedAt:   i.CreatedAt.Format(time.RFC3339Nano),
 	}
 }
 
@@ -115,10 +117,3 @@ func parseAmount(s string) (decimal.Decimal, *errs.Error) {
 	}
 	return d, nil
 }
-
-// rfc3339Nano is the timestamp format used in API responses.
-// Using a const here so all response timestamps stay consistent;
-// time.Time would marshal with the same format via its own
-// MarshalJSON, but we're stringifying explicitly to keep the schema
-// uniform.
-const rfc3339Nano = "2006-01-02T15:04:05.999999999Z07:00"

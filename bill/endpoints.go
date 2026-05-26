@@ -428,7 +428,7 @@ func (s *Service) closeBillFromDB(ctx context.Context, id string) (*CloseBillRes
 		CloseReason: bill.CloseReason,
 	}
 	if bill.ClosedAt != nil {
-		s := bill.ClosedAt.Format(rfc3339Nano)
+		s := bill.ClosedAt.Format(time.RFC3339Nano)
 		resp.ClosedAt = &s
 	}
 	return resp, nil
